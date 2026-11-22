@@ -1,5 +1,14 @@
 # snmp2opcua: SNMP trap to OPC UA gateway
 
+> **Written by Claude.** The code, tests and this README were written by Claude (Anthropic's AI model, Claude Opus 5.5) in November 2026, at the request of the repository owner.
+>
+> **What it was tested against:**
+> - automated tests
+> - simulated devices: SNMP v1/v2c/v3 traps and informs, and a simulated GE MDS Orbit master station
+> - stand-ins for the OPC UA library (asyncua) and for the desktop window's Tkinter
+>
+> It has **not yet been run against real devices, a real OPC UA client, or on a real desktop**. Review it and test it with your own equipment before relying on it in production.
+
 Receives SNMP traps from switches, UPSs, PLCs, firewalls and similar devices, and publishes them over OPC UA so SCADA, HMI and historian systems can use them.
 
 ```
