@@ -1,0 +1,86 @@
+# snmp2opcua configuration
+# Anything you leave out falls back to the defaults in snmp2opcua/config.py
+
+snmp:
+  listen_host: 0.0.0.0
+  listen_port: 162              # needs root/admin (or CAP_NET_BIND_SERVICE); use e.g. 1162 for testing
+  communities: [public]         # accepted v1/v2c communities; [] = accept any
+  allowed_sources: []           # e.g. [10.10.0.0/16, 192.168.1.20]; [] = any source
+  respond_to_informs: true      # acknowledge INFORMs (and answer SNMPv3 engine discovery)
+  versions: [v1, v2c, v3]       # e.g. [v3] to accept only authenticated/encrypted traps
+
+  v3:
+    engine_id: null             # gateway engine ID (hex). null = generate once and keep in state_file
+    state_file: snmp2opcua_engine.json   # stores engine ID + boots counter (must be writable)
+    replay_protection: true     # RFC 3414 timeliness check for traps; disable only for devices
+                                # that reset engineBoots on reboot
+    users:
+      # auth_protocol: MD5, SHA, SHA224, SHA256, SHA384, SHA512, NONE
+      # priv_protocol: DES, AES (=AES128), AES192, AES256, AES192C, AES256C, NONE
+      #   AES192/AES256 = Blumenthal key extension (net-snmp default)
+      #   AES192C/AES256C = Reeder key extension (Cisco and many network devices)
+      # Keys: at least 8 characters. Use ${ENV_VAR} to keep them out of this file.
+      - name: opcgw
+        auth_protocol: SHA256
+        auth_key: ${SNMP_AUTH_KEY}
+        priv_protocol: AES
+        priv_key: ${SNMP_PRIV_KEY}
+        # engine_ids: [800000090300aabbccddeeff]   # optional: only accept traps from these devices
+      # - name: legacy-ups
+      #   auth_protocol: MD5
+      #   auth_key: "ups-auth-pass"
+      #   priv_protocol: DES
+      #   priv_key: "ups-priv-pass"
+
+opcua:
+  mode: server                  # server = host our own OPC UA server; client = write into an existing one
+
+  server:
+    endpoint: opc.tcp://0.0.0.0:4840/snmp2opcua/
+    server_name: SNMP Trap Gateway
+    namespace: urn:snmp2opcua:gateway
+    # NoSecurity is fine for a lab. For production use e.g. [Basic256Sha256_SignAndEncrypt]
+    # and supply a certificate + key (see README).
+    security_policies: [NoSecurity]
+    certificate: null           # e.g. certs/server_cert.der
+    private_key: null           # e.g. certs/server_key.pem
+    events: true                # fire an OPC UA event (SnmpTrapEventType) per trap
+    recent_traps: 50            # size of Gateway/RecentTrapsJson
+    max_devices: 1000           # cap on per-source device nodes
+
+  client:
+    url: opc.tcp://192.168.1.50:4840
+    username: null
+    password: null              # or set the OPCUA_PASSWORD environment variable
+    # "Policy,Mode,client_cert,client_key", e.g. "Basic256Sha256,SignAndEncrypt,certs/cert.der,certs/key.pem"
+    security_string: null
+    timeout: 4
+    reconnect_delay: 5
+    # Map trap fields to NodeIds that already exist on the target server. Use any subset.
+    # Fields: trap_json, varbinds_json, source_ip, version, trap_oid, trap_name,
+    #         uptime, received_at, severity, trap_count, summary
+    nodes:
+      trap_json: "ns=2;s=SNMP.LastTrapJson"
+      source_ip: "ns=2;s=SNMP.LastSourceIP"
+      trap_name: "ns=2;s=SNMP.LastTrapName"
+      trap_count: "ns=2;s=SNMP.TrapCount"
+
+traps:
+  queue_size: 10000             # traps buffered while OPC UA is slow/unreachable
+  # Friendly names for vendor OIDs (prefix match, so table columns get ".<index>" appended)
+  oid_names:
+    1.3.6.1.4.1.9.9.41.2.0.1: ciscoSyslogMIBclogMessageGenerated
+    1.3.6.1.4.1.9.9.43.2.0.1: ciscoConfigManEvent
+  # OPC UA event severity, 1..1000. Keys are trap names or OID prefixes.
+  severity:
+    default: 500
+    rules:
+      linkDown: 800
+      linkUp: 300
+      coldStart: 600
+      warmStart: 400
+      authenticationFailure: 700
+      upsTrapOnBattery: 900
+
+logging:
+  level: INFO

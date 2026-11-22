@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+# SNMPv3 engine state (engine ID + boots counter), created at runtime
+snmp2opcua_engine.json
+# OPC UA certificates / private keys
+certs/
+*.pem
+*.der
+# local secrets
+.env
+*.env
