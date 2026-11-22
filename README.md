@@ -36,7 +36,7 @@ It has two modes:
 - OPC UA event severity is mapped per trap name or OID prefix
 - Each source device gets its own node with a trap count and its last trap
 - A bounded queue holds traps while OPC UA is slow or unreachable. In client mode the gateway reconnects automatically
-- **Desktop window** to start and stop the gateway, watch traps arrive, see why packets were rejected, run diagnostics, send test traps and edit the configuration
+- **Desktop window** to start and stop the gateway, see live data for every tag, watch traps arrive, see why packets were rejected, run diagnostics, send test traps and edit the configuration
 - Runs on Linux and Windows, Python 3.9+ (tested on 3.13)
 
 ## Install and run
@@ -131,6 +131,12 @@ On Windows you can also double-click `run_gui.pyw`, which uses the `config.yaml`
   - High-severity rows (800 or more) are tinted red and medium ones (600–799) amber. The severity number and label are always shown as text as well.
   - You can filter by any text (source, trap name, numeric OID, v3 user, values), pause the feed, and export to CSV.
   - Select a trap to see its full JSON.
+- **Live data:** every tag the gateway publishes in one live list, like a quick client.
+  - It covers trap tags, the events queue, polled values, Remote1…RemoteN, and the gateway's own OPC UA objects (status counters, last trap, per-source nodes).
+  - Columns: tag, value, data type, quality, last update, update count and source (Trap, Poll or Gateway). A value that just changed is highlighted for two seconds, and Bad quality rows are tinted with the word "Bad".
+  - Filter by tag name or value, and pick a view: all tags, changed in the last minute, Bad quality, trap tags, polled tags or gateway objects.
+  - Click a column heading to sort, *Pause* to freeze the view (updates keep counting), and *Export snapshot CSV…* to save every visible tag with its NodeId.
+  - Select a tag to see its OPC UA NodeId (`ns=2;s=…`) and full value. *Copy NodeId* is there for setting up SCADA clients.
 - **Tags:** the Channel → Device → Tag tree with live values and Good/Bad quality, like a quick client.
   - By default it shows trap tags, your own tags, `EVENTS_COUNT` and `EVENTS_001`. Tick the box to see every table field and the whole events queue.
   - *Export tags CSV…* writes the selected device's tags in KEPServerEX's CSV layout.

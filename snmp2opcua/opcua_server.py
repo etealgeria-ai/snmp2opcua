@@ -28,6 +28,10 @@ from .trap import Trap
 
 log = logging.getLogger("snmp2opcua.opcua_server")
 
+# OPC UA built-in type -> data type name as shown in the window (server-style names)
+KEPWARE_TYPE = {"Boolean": "Boolean", "String": "String", "Int32": "Long", "UInt32": "DWord", "UInt64": "QWord",
+                "Float": "Float", "Double": "Double", "DateTime": "Date"}
+
 S = ua.VariantType.String
 U32 = ua.VariantType.UInt32
 U64 = ua.VariantType.UInt64
@@ -44,6 +48,11 @@ class OpcUaServerPublisher:
         self.extra_tags: list[tuple[str, str]] = []             # (path, data type), e.g. polling status
         self._folders: dict[str, object] = {}
         self._objects = None
+        # writes to the gateway's own nodes are reported to the desktop window's Live data view
+        self.observer = None
+        self.node_paths: dict = {}                              # node -> "Gateway.LastTrap.TrapName"
+        self.gw_catalog: dict[str, tuple[object, str]] = {}     # path -> (initial value, data type)
+        self._pending: list[tuple[str, object, str]] = []
         self.engine = None                                      # set by the gateway (for client resets)
         self._reset_sub = None
         self.server: Server | None = None
@@ -65,11 +74,36 @@ class OpcUaServerPublisher:
         return await parent.add_object(self._nid(path), self._qn(name))
 
     async def _var(self, parent, path: str, name: str, value, vtype):
-        return await parent.add_variable(self._nid(f"{path}.{name}"), self._qn(name), value, varianttype=vtype)
+        node = await parent.add_variable(self._nid(f"{path}.{name}"), self._qn(name), value, varianttype=vtype)
+        full = f"{path}.{name}"
+        self.node_paths[node] = full
+        self.gw_catalog[full] = (value, KEPWARE_TYPE.get(vtype.name, vtype.name))
+        if self.server is not None:                    # created while running (a new trap source)
+            self._pending.append((full, value, KEPWARE_TYPE.get(vtype.name, vtype.name)))
+        return node
 
-    @staticmethod
-    async def _write(node, value, vtype):
+    async def _write(self, node, value, vtype):
         await node.write_value(value, vtype)
+        path = self.node_paths.get(node)
+        if path is not None:
+            dtype = KEPWARE_TYPE.get(vtype.name, vtype.name)
+            self.gw_catalog[path] = (value, dtype)
+            if self.observer is not None:
+                self._pending.append((path, value, dtype))
+
+    def _flush(self) -> None:
+        if self._pending and self.observer is not None:
+            items, self._pending = self._pending, []
+            try:
+                self.observer(items)
+            except Exception:
+                log.debug("observer failed", exc_info=True)
+        else:
+            self._pending = []
+
+    def catalog(self) -> list[tuple[str, object, str]]:
+        """The gateway's own variables (Status, LastTrap, ...) with their current values."""
+        return [(p, v, t) for p, (v, t) in self.gw_catalog.items()]
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -288,6 +322,7 @@ class OpcUaServerPublisher:
             ev.TrapName = trap.trap_name
             ev.VarBindsJson = varbinds_json
             await self.evgen.trigger(message=trap.summary())
+        self._flush()
 
     def diagnostics(self) -> dict:
         return {"kind": "server", "endpoint": self.cfg["endpoint"], "running": self.server is not None,
@@ -303,3 +338,4 @@ class OpcUaServerPublisher:
         await self._write(n["dropped"], stats.dropped, U64)
         await self._write(n["rejected"], stats.rejected, U64)
         await self._write(n["malformed"], stats.malformed, U64)
+        self._flush()

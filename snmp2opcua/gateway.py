@@ -58,7 +58,7 @@ class Gateway:
             try:
                 trap.tag_updates = self.engine.process(trap)
                 if trap.tag_updates:
-                    self._notify("tags", [(u.path, self.engine.values[u.path][0], u.good)
+                    self._notify("tags", [(u.path, self.engine.values[u.path][0], u.good, u.data_type, "trap")
                                           for u in trap.tag_updates if u.path in self.engine.values])
                 await self.publisher.publish(trap)
                 self.stats.published += 1
@@ -73,13 +73,36 @@ class Gateway:
 
     async def _on_poll(self, poller: DevicePoller, updates: list) -> None:
         self.engine.set_values(updates)
-        self._notify("tags", [(u.path, u.value, u.good, u.data_type) for u in updates])
+        self._notify("tags", [(u.path, u.value, u.good, u.data_type, "poll") for u in updates])
         if poller.cfg.ge_orbit_remotes:
             self._notify("radios", {"master": poller.dev.path, "rows": poller.radios(),
                                     "ok": poller.stats.consecutive_failures == 0, "error": poller.stats.last_error})
         apply = getattr(self.publisher, "apply_updates", None)
         if apply is not None:
             await apply(updates)
+
+    def _send_catalog(self) -> None:
+        """Every tag the gateway publishes, with current values, for the window's Live data view."""
+        if self.monitor is None:
+            return
+        from .snmp_driver import INITIAL, PollAddress
+        items = []
+        for dev, tag in self.engine.all_tags():
+            path = dev.tag_path(tag)
+            value, good, _ = self.engine.values.get(path, (INITIAL[tag.data_type], True, None))
+            items.append((path, value, good, tag.data_type,
+                          "poll" if isinstance(tag.address, PollAddress) else "trap"))
+        known = {i[0] for i in items}
+        for p in self.pollers:
+            for path, dtype in p.static_tags():
+                if path not in known:
+                    items.append((path, INITIAL[dtype] if INITIAL[dtype] is not None else "", False, dtype, "poll"))
+        catalog = getattr(self.publisher, "catalog", None)
+        if catalog is not None:
+            items += [(path, value, True, dtype, "gateway") for path, value, dtype in catalog()]
+            self.publisher.observer = lambda batch: self._notify(
+                "tags", [(path, value, True, dtype, "gateway") for path, value, dtype in batch])
+        self._notify("catalog", items)
 
     def _notify(self, kind: str, payload) -> None:
         """Tell the desktop UI; a failing UI callback must never cost a trap."""
@@ -116,6 +139,7 @@ class Gateway:
             log.info("SNMPv3 enabled: engine ID %s, boots %d, users: %s", engine_id.hex(), boots,
                      ", ".join(f"{u.name} ({u.level})" for u in users))
         await self.publisher.start()
+        self._send_catalog()
         tasks = []
         endpoints = listen_endpoints(self.cfg)       # computed now, so later overrides (--port, tests) apply
         try:

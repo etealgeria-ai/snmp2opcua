@@ -376,7 +376,11 @@ class GatewayPollingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(radios and radios[-1]["ok"] and len(radios[-1]["rows"]) == 3)
         self.assertEqual(gw.engine.values["Radios.Master_LN4.Remotes.00063D123457.RSSI"][0], -97)
         tags = [pl for k, pl in seen if k == "tags"]
-        self.assertTrue(any(len(t) == 4 and t[3] == "Long" for batch in tags for t in batch))
+        self.assertTrue(any(t[3:] == ("Long", "poll") for batch in tags for t in batch))
+        catalog = next(pl for k, pl in seen if k == "catalog")
+        paths = {c[0]: c for c in catalog}
+        self.assertEqual(paths["Radios.Master_LN4.Remote1"][2:], (False, "Long", "poll"))      # before 1st poll
+        self.assertIn("Radios.Master_LN4._Polling.OK", paths)
 
 
 if __name__ == "__main__":

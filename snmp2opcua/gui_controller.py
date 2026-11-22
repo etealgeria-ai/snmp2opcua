@@ -205,6 +205,8 @@ class GatewayController:
             self.events.put(("tags", list(payload)))
         elif kind == "radios":
             self.events.put(("radios", dict(payload)))
+        elif kind == "catalog":
+            self.events.put(("catalog", list(payload)))
         else:
             payload = dict(payload, time=datetime.now().strftime("%H:%M:%S"))
             self.events.put((kind, payload))

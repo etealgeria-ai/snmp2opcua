@@ -417,7 +417,10 @@ channels:
         started = next(p for k, p in seen if k == "started")
         self.assertEqual(started["listen"], [f"UDP 127.0.0.1:{udp}", f"TCP 127.0.0.1:{tcp}"])
         tag_events = [p for k, p in seen if k == "tags"]
-        self.assertTrue(any(("Channel1.Switch1.linkDown", True, True) in ev for ev in tag_events))
+        self.assertTrue(any(("Channel1.Switch1.linkDown", True, True, "Boolean", "trap") in ev for ev in tag_events))
+        catalog = {c[0]: c for c in next(p for k, p in seen if k == "catalog")}
+        self.assertEqual(catalog["Channel1.Switch1.linkDown"][1:], (False, True, "Boolean", "trap"))
+        self.assertEqual(catalog["Channel1.Ups1.EVENTS_COUNT"][3:], ("DWord", "trap"))
 
     async def test_listener_error_wording(self):
         port = free_port(socket.SOCK_DGRAM)

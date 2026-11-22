@@ -15,6 +15,7 @@ import logging
 import queue
 import sys
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +51,7 @@ WARN_INK = "#7A5200"
 ALARM = "#B3261E"
 ALARM_TINT = "#F5D5D2"
 STOPPED = "#8A949C"
+CHANGE_TINT = "#DCE6EF"   # brief highlight of a value that just changed (answers "what moved?")
 
 MAX_TRAPS = 5000
 MAX_REJECTS = 2000
@@ -90,12 +92,17 @@ class GatewayApp:
         self.tag_values: dict[str, tuple[object, bool, str]] = {}   # path -> (value, good, time)
         self.tag_devices: list[DeviceDef] = []
         self.dynamic_types: dict[str, str] = {}          # polled tags not in the config (e.g. remote radios)
+        self.config_tag_paths: set[str] = set()          # tags defined by the configuration
         self.radios: dict[str, dict] = {}                 # master path -> last "radios" payload
         self.station_list: list[stations_mod.Station] = []
         self.station_current: stations_mod.Station | None = None   # None = adding a new station
         self.station_dirty = False
         self.station_loading = False
         self.station_testing = False
+        self.live: dict[str, dict] = {}                   # path -> value, good, dtype, source, updated, count, changed
+        self.live_paused = False
+        self.live_unseen = 0
+        self.live_sort = ("tag", False)
 
         self._setup_style()
         self._build()
@@ -207,6 +214,7 @@ class GatewayApp:
         self.nb = ttk.Notebook(root)
         self.nb.pack(side="top", fill="both", expand=True, padx=12)
         self.tab_traps = self._build_traps_tab()
+        self.tab_live = self._build_live_tab()
         self.tab_tags = self._build_tags_tab()
         self.tab_radios = self._build_radios_tab()
         self.tab_devices = self._build_devices_tab()
@@ -288,6 +296,245 @@ class GatewayApp:
         self.trap_detail = self._text_box(bottom, height=9, readonly=True)
         pane.add(bottom, weight=1)
         return tab
+
+    # ------------------------------------------------------------------ live data tab
+    LIVE_VIEWS = ["All tags", "Changed in the last minute", "Bad quality", "Trap tags", "Polled tags",
+                  "Gateway objects"]
+
+    def _build_live_tab(self) -> ttk.Frame:
+        tab = ttk.Frame(self.nb, padding=(0, 10, 0, 0))
+        self.nb.add(tab, text="Live data")
+        bar = ttk.Frame(tab)
+        bar.pack(side="top", fill="x", pady=(0, 8))
+        ttk.Label(bar, text="Filter").pack(side="left")
+        self.live_filter = tk.StringVar()
+        self.live_filter.trace_add("write", lambda *_: self._rebuild_live())
+        ttk.Entry(bar, textvariable=self.live_filter, width=30).pack(side="left", padx=(6, 0))
+        self.live_view = tk.StringVar(value=self.LIVE_VIEWS[0])
+        view = ttk.Combobox(bar, textvariable=self.live_view, values=self.LIVE_VIEWS, state="readonly", width=26)
+        view.pack(side="left", padx=(10, 0))
+        view.bind("<<ComboboxSelected>>", lambda _e: self._rebuild_live())
+        self.live_count = ttk.Label(bar, text="", style="Muted.TLabel")
+        self.live_count.pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="Export snapshot CSV…", command=self.export_live).pack(side="right")
+        self.btn_live_pause = ttk.Button(bar, text="Pause", command=self.toggle_live_pause)
+        self.btn_live_pause.pack(side="right", padx=(0, 6))
+
+        pane = ttk.Panedwindow(tab, orient="vertical")
+        pane.pack(side="top", fill="both", expand=True)
+        top = ttk.Frame(pane)
+        cols = [("tag", "Tag", 360, True), ("value", "Value", 300, True), ("type", "Data type", 80, False),
+                ("quality", "Quality", 70, False), ("updated", "Updated", 90, False), ("updates", "Updates", 70, False),
+                ("source", "Source", 80, False)]
+        self.live_tree = self._make_tree(top, cols)
+        for cid, heading, _w, _s in cols:
+            self.live_tree.heading(cid, text=heading, anchor="w", command=self._live_sorter(cid))
+        self.live_tree.tag_configure("bad", background=WARN_TINT)
+        self.live_tree.tag_configure("changed", background=CHANGE_TINT)
+        self.live_tree.bind("<<TreeviewSelect>>", self._show_live_detail)
+        self.empty_live = tk.Label(top, background=FIELD, foreground=MUTED, font=self.f_base, justify="center",
+                                   text="No tags yet.\nStart the gateway to see every tag it publishes, live.")
+        self.empty_live.place(relx=0.5, rely=0.5, anchor="center")
+        pane.add(top, weight=4)
+
+        bottom = ttk.Frame(pane, padding=(0, 8, 0, 0))
+        head = ttk.Frame(bottom)
+        head.pack(side="top", fill="x")
+        self.live_nodeid = ttk.Label(head, text="Select a tag to see its OPC UA NodeId and full value.",
+                                     style="Muted.TLabel")
+        self.live_nodeid.pack(side="left")
+        ttk.Button(head, text="Copy NodeId", command=self.copy_live_nodeid).pack(side="right")
+        box = ttk.Frame(bottom)
+        box.pack(side="top", fill="both", expand=True, pady=(6, 0))
+        self.live_detail = self._text_box(box, height=4, readonly=True, wrap="word")
+        pane.add(bottom, weight=1)
+        return tab
+
+    @staticmethod
+    def _source_label(source: str) -> str:
+        return {"trap": "Trap", "poll": "Poll", "gateway": "Gateway"}.get(source, source)
+
+    def _live_matches(self, path: str, e: dict) -> bool:
+        needle = self.live_filter.get().strip().lower()
+        if needle and needle not in path.lower() and needle not in self._fmt_value(e["value"]).lower():
+            return False
+        view = self.live_view.get()
+        if view == "Changed in the last minute":
+            return e["changed"] is not None and time.monotonic() - e["changed"] <= 60
+        if view == "Bad quality":
+            return not e["good"]
+        if view == "Trap tags":
+            return e["source"] == "trap"
+        if view == "Polled tags":
+            return e["source"] == "poll"
+        if view == "Gateway objects":
+            return e["source"] == "gateway"
+        return True
+
+    def _live_row(self, path: str, e: dict) -> tuple:
+        when = e["updated"].strftime("%H:%M:%S") if e["updated"] else ""
+        return (path, self._fmt_value(e["value"]), e["dtype"], "Good" if e["good"] else "Bad", when,
+                e["count"], self._source_label(e["source"]))
+
+    def _live_tags(self, e: dict) -> tuple[str, ...]:
+        if not e["good"]:
+            return ("bad",)
+        if e["changed"] is not None and time.monotonic() - e["changed"] < 2.0:
+            return ("changed",)
+        return ()
+
+    def _live_sorter(self, column: str):
+        def sort() -> None:
+            self._live_sort_by(column)
+        return sort
+
+    def _live_sort_by(self, column: str) -> None:
+        col, desc = self.live_sort
+        self.live_sort = (column, not desc if col == column else column in ("updated", "updates"))
+        self._rebuild_live()
+
+    def _rebuild_live(self) -> None:
+        tree = self.live_tree
+        selected = tree.selection()
+        tree.delete(*tree.get_children())
+        col, desc = self.live_sort
+        keys = {"tag": lambda kv: kv[0].lower(), "value": lambda kv: self._fmt_value(kv[1]["value"]).lower(),
+                "type": lambda kv: kv[1]["dtype"], "quality": lambda kv: kv[1]["good"],
+                "updated": lambda kv: kv[1]["updated"] or datetime.min, "updates": lambda kv: kv[1]["count"],
+                "source": lambda kv: kv[1]["source"]}
+        rows = sorted(((p, e) for p, e in self.live.items() if self._live_matches(p, e)),
+                      key=keys.get(col, keys["tag"]), reverse=desc)
+        for path, e in rows:
+            tree.insert("", "end", iid=f"lv:{path}", values=self._live_row(path, e), tags=self._live_tags(e))
+        if selected and tree.exists(selected[0]):
+            tree.selection_set(selected[0])
+        self._update_live_count(len(rows))
+
+    def _update_live_count(self, shown: int | None = None) -> None:
+        shown = len(self.live_tree.get_children()) if shown is None else shown
+        total = len(self.live)
+        bad = sum(1 for e in self.live.values() if not e["good"])
+        self.live_count.configure(text=(f"Showing {shown:,} of {total:,} tags" + (f", {bad:,} with Bad quality"
+                                                                                  if bad else "")) if total else "")
+        if total:
+            self.empty_live.place_forget()
+        else:
+            self.empty_live.place(relx=0.5, rely=0.5, anchor="center")
+
+    def _on_catalog(self, items: list) -> None:
+        self.live = {}
+        for path, value, good, dtype, source in items:
+            self.live[path] = {"value": value, "good": good, "dtype": dtype, "source": source, "updated": None,
+                               "count": 0, "changed": None}
+        self._rebuild_live()
+
+    def _live_ingest(self, updates: list) -> None:
+        now = datetime.now()
+        mono = time.monotonic()
+        added = False
+        for item in updates:
+            path, value, good = item[0], item[1], item[2]
+            dtype = item[3] if len(item) > 3 else ""
+            source = item[4] if len(item) > 4 else ("gateway" if path.startswith("Gateway.") else "trap")
+            e = self.live.get(path)
+            if e is None:
+                e = self.live[path] = {"value": None, "good": good, "dtype": dtype, "source": source,
+                                       "updated": None, "count": 0, "changed": None}
+                added = True
+            if e["value"] != value or e["good"] != good:
+                e["changed"] = mono
+            e.update(value=value, good=good, updated=now, count=e["count"] + 1)
+            if dtype:
+                e["dtype"] = dtype
+            if self.live_paused:
+                self.live_unseen += 1
+                continue
+            iid = f"lv:{path}"
+            if self.live_tree.exists(iid):
+                self.live_tree.item(iid, values=self._live_row(path, e), tags=self._live_tags(e))
+            elif self._live_matches(path, e):
+                added = True
+        if self.live_paused:
+            self.btn_live_pause.configure(text=f"Resume ({self.live_unseen:,} updates)")
+        elif added:
+            self._rebuild_live()
+        else:
+            self._update_live_count()
+        if self.live_tree.selection() and not self.live_paused:
+            self._show_live_detail()
+
+    def _live_tick(self) -> None:
+        """Clear change highlights after 2 s; keep the 'changed in the last minute' view current."""
+        if self.live_paused or not self.live:
+            return
+        if self.live_view.get() == "Changed in the last minute":
+            self._rebuild_live()
+            return
+        mono = time.monotonic()
+        for path, e in self.live.items():
+            if e["changed"] is not None and 2.0 <= mono - e["changed"] < 3.5:
+                iid = f"lv:{path}"
+                if self.live_tree.exists(iid):
+                    self.live_tree.item(iid, tags=self._live_tags(e))
+
+    def toggle_live_pause(self) -> None:
+        self.live_paused = not self.live_paused
+        if self.live_paused:
+            self.live_unseen = 0
+            self.btn_live_pause.configure(text="Resume")
+        else:
+            self.btn_live_pause.configure(text="Pause")
+            self._rebuild_live()
+
+    def _selected_live(self) -> str | None:
+        sel = self.live_tree.selection()
+        return sel[0][3:] if sel else None
+
+    def _show_live_detail(self, _event=None) -> None:
+        path = self._selected_live()
+        e = self.live.get(path) if path else None
+        if path is None or e is None:
+            return
+        self.live_nodeid.configure(text=f"ns=2;s={path}   ({e['dtype']}, {self._source_label(e['source'])}, "
+                                        f"{'Good' if e['good'] else 'Bad'} quality, {e['count']:,} updates)",
+                                   style="TLabel")
+        self.live_detail.configure(state="normal")
+        self.live_detail.delete("1.0", "end")
+        self.live_detail.insert("1.0", self._fmt_value(e["value"]))
+        self.live_detail.configure(state="disabled")
+
+    def copy_live_nodeid(self) -> None:
+        path = self._selected_live()
+        if path is None:
+            self.status_line.configure(text="Select a tag first.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(f"ns=2;s={path}")
+        self.status_line.configure(text=f"Copied ns=2;s={path} (namespace index 2 is the usual value).")
+
+    def export_live(self) -> None:
+        rows = [(p, e) for p, e in sorted(self.live.items()) if self._live_matches(p, e)]
+        if not rows:
+            messagebox.showinfo("Export snapshot", "There are no tags to export.", parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(parent=self.root, title="Export live data snapshot",
+                                            defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+                                            initialfile=f"snmp2opcua-live-{datetime.now():%Y%m%d-%H%M%S}.csv")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["Tag", "NodeId", "Value", "Data Type", "Quality", "Updated", "Updates", "Source"])
+                for p, e in rows:
+                    w.writerow([p, f"ns=2;s={p}", self._fmt_value(e["value"]), e["dtype"],
+                                "Good" if e["good"] else "Bad",
+                                e["updated"].isoformat(timespec="seconds") if e["updated"] else "", e["count"],
+                                self._source_label(e["source"])])
+        except OSError as exc:
+            messagebox.showerror("Export snapshot", f"Couldn't write {path}: {exc}", parent=self.root)
+            return
+        self.status_line.configure(text=f"Exported {len(rows):,} tags to {path}")
 
     # ------------------------------------------------------------------ tags tab
     def _build_tags_tab(self) -> ttk.Frame:
@@ -411,12 +658,13 @@ class GatewayApp:
         return True
 
     def _on_tags(self, updates: list) -> None:
+        self._live_ingest(updates)
         now = datetime.now().strftime("%H:%M:%S")
         for path, value, good, *rest in updates:
             self.tag_values[path] = (value, good, now)
             iid = f"tag:{path}"
-            if not self.tag_tree.exists(iid) and rest:
-                self._ensure_dynamic_row(path, rest[0])
+            if not self.tag_tree.exists(iid) and rest and path not in self.config_tag_paths:
+                self._ensure_dynamic_row(path, rest[0])      # e.g. a newly seen remote radio
             if self.tag_tree.exists(iid):
                 row = self.tag_tree.item(iid)["values"]
                 self.tag_tree.item(iid, values=(row[0], row[1], self._fmt_value(value), "Good" if good else "Bad",
@@ -1122,6 +1370,7 @@ class GatewayApp:
         if [d.path for d in devices] != [d.path for d in self.tag_devices] or \
                 [len(d.tags) for d in devices] != [len(d.tags) for d in self.tag_devices]:
             self.tag_devices = devices
+            self.config_tag_paths = {d.tag_path(t) for d in devices for t in d.tags}
             self._rebuild_tag_tree()
         snmp = cfg["snmp"]
         self.t_port.set(str(snmp["listen_port"]))
@@ -1298,8 +1547,11 @@ class GatewayApp:
             self._on_radios(payload)
         elif kind == "station_test":
             self._on_station_test(*payload)
+        elif kind == "catalog":
+            self._on_catalog(payload)
 
     def _tick(self) -> None:
+        self._live_tick()
         stats = self.ctl.stats()
         for key, (stripe, num, cap, caption) in self.tiles.items():
             value = stats.get(key)
