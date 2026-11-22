@@ -765,7 +765,7 @@ class GatewayApp:
         self.radio_tree = self._make_tree(box, [
             ("master", "Master station", 170, False), ("mac", "Remote MAC", 150, False),
             ("ip", "Remote IP", 130, False), ("rssi", "RSSI (dBm)", 90, False), ("ifindex", "IfIndex", 70, False),
-            ("status", "Status", 180, True), ("seen", "Last seen", 90, False), ("tag", "OPC UA tag", 100, False)])
+            ("status", "Status", 230, True), ("seen", "Last seen", 90, False), ("tag", "OPC UA tag", 100, False)])
         self.radio_tree.tag_configure("offline", background=ALARM_TINT)
         self.radio_tree.tag_configure("weak", background=WARN_TINT)
         self.empty_radios = tk.Label(box, background=FIELD, foreground=MUTED, font=self.f_base, justify="center",
@@ -785,7 +785,8 @@ class GatewayApp:
             if not r["poll_ok"]:
                 status, tag = "Unknown, master not answering", ("offline",)
             elif not r["online"]:
-                status, tag = "Offline", ("offline",)
+                why = f"link {r['link']}" if r.get("listed", True) and r.get("link") else "not in master's table"
+                status, tag = f"Offline, {why}", ("offline",)
             elif r["weak"]:
                 status, tag = "Online, weak signal", ("weak",)
             else:

@@ -10,19 +10,34 @@ def oid_key(oid: str):
     return tuple(int(x) for x in oid.split("."))
 
 
-def orbit_mib(remotes, if_index=3, ip_as_octets=False):
-    """remotes: list of (mac 'AA:BB:..', ip, rssi). Builds the GE MDS Orbit remote table columns."""
+def orbit_mib(remotes, if_index=3, ip_as_octets=True, link=True, length_prefixed=False):
+    """The GE MDS Orbit master's MDS-IF-LN-MIB::mIfLnStatusConnRemTable.
+
+    remotes: (mac 'AA:BB:..', ip, rssi) or (mac, ip, rssi, link status). Column types follow
+    the MIB: the IP is an InetIpAddress (OCTET STRING of 4 or 16 octets) unless ip_as_octets
+    is False (IpAddress, as some firmware sends); link=False leaves out the link status
+    column (older firmware); length_prefixed puts a length before the MAC in the index, as a
+    non-conforming agent might.
+    """
+    import ipaddress
     mib = {"1.3.6.1.2.1.1.5.0": ber.encode_octets("LN4-MASTER"),
            "1.3.6.1.2.1.1.3.0": ber.encode_int(123456, ber.TIMETICKS)}
-    for mac, ip, rssi in remotes:
-        idx = f"{if_index}." + ".".join(str(int(b, 16)) for b in mac.split(":"))
-        mib[f"{ORBIT_TABLE}.1.{idx}"] = ber.encode_int(1)
+    for remote in remotes:
+        mac, ip, rssi = remote[:3]
+        status = remote[3] if len(remote) > 3 else 4                  # associated(4)
+        octets = bytes(int(b, 16) for b in mac.split(":"))
+        idx = f"{if_index}." + ("6." if length_prefixed else "") + ".".join(str(b) for b in octets)
+        mib[f"{ORBIT_TABLE}.1.{idx}"] = ber.encode_octets(octets)                  # ConnRemAddress
         if ip_as_octets:
-            mib[f"{ORBIT_TABLE}.2.{idx}"] = ber.encode_octets(bytes(int(p) for p in ip.split(".")))
+            mib[f"{ORBIT_TABLE}.2.{idx}"] = ber.encode_octets(ipaddress.ip_address(ip).packed)
         else:
             mib[f"{ORBIT_TABLE}.2.{idx}"] = ber.encode_ip(ip)
-        mib[f"{ORBIT_TABLE}.6.{idx}"] = ber.encode_int(rssi)
-        mib[f"{ORBIT_TABLE}.7.{idx}"] = ber.encode_int(25)          # another column after RSSI
+        mib[f"{ORBIT_TABLE}.3.{idx}"] = ber.encode_int(300, ber.GAUGE32)          # TimeToLive
+        if link:
+            mib[f"{ORBIT_TABLE}.4.{idx}"] = ber.encode_int(status)                 # LinkStatus
+        mib[f"{ORBIT_TABLE}.5.{idx}"] = ber.encode_int(1, ber.GAUGE32)            # NicId
+        mib[f"{ORBIT_TABLE}.6.{idx}"] = ber.encode_int(rssi)                       # Rssi
+        mib[f"{ORBIT_TABLE}.7.{idx}"] = ber.encode_int(25, ber.GAUGE32)           # Evm
     mib["1.3.6.1.4.1.4130.99.1.0"] = ber.encode_int(7)               # something after the table
     return mib
 

@@ -6,8 +6,14 @@ Per device (``polling:`` in the config):
 * ``ge_orbit_remotes: true`` reads the GE MDS Orbit master's remote table and gives each
   remote radio its own tags (folder named after its MAC):
 
-      <Channel>.<Device>.Remotes.<MAC>.MAC / IP / RSSI / IfIndex / Online / LastSeen
+      <Channel>.<Device>.Remotes.<MAC>.MAC / IP / RSSI / IfIndex / LinkStatus / Online / LastSeen
       <Channel>.<Device>.Remotes.Count / OnlineCount
+
+  A remote is online while the master lists it with link status associated(4)
+  (MDS-IF-LN-MIB mIfLnStatusConnRemLinkStatus). Rows age out slowly, so a remote whose link
+  dropped stays listed for a while with its last RSSI; it shows as offline with LinkStatus
+  "disassociated". If the master doesn't report link status, listed means online.
+  LastSeen is the last poll that found the remote online.
 
 * fixed RSSI tags Remote1..RemoteN (``remote_tags``, default 50) for SCADA screens:
 
@@ -23,7 +29,8 @@ Per device (``polling:`` in the config):
       <Channel>.<Device>._Polling.OK / Error / LastPoll / DurationMs / Failures
 
 When a poll fails, polled tags keep their last value with Bad quality, as an OPC server does.
-A remote that drops out of the master's table is marked Online = 0 and keeps its last RSSI.
+A remote that drops out of the master's table, or whose link isn't associated, is marked
+Online = 0 and keeps its last RSSI.
 """
 from __future__ import annotations
 
@@ -48,8 +55,9 @@ GET_BATCH = 16
 @dataclass
 class RemoteState:
     remote: ge_orbit.Remote
-    online: bool = True
-    last_seen: datetime | None = None
+    online: bool = True                   # listed and the link is associated
+    last_seen: datetime | None = None     # last poll that found it online
+    listed: bool = True                   # still in the master's table
 
 
 @dataclass
@@ -211,6 +219,7 @@ class DevicePoller:
                 Update(f"{base}.RSSI", r.rssi if r.rssi is not None else 0, "Long",
                        good=good and r.rssi is not None),
                 Update(f"{base}.IfIndex", r.if_index, "Long", good=good),
+                Update(f"{base}.LinkStatus", r.link_text, "String", good=good and r.link_status is not None),
                 Update(f"{base}.Online", st.online, "Boolean", good=good),
                 Update(f"{base}.LastSeen", st.last_seen, "Date", good=good and st.last_seen is not None)]
 
@@ -253,19 +262,29 @@ class DevicePoller:
         seen = set()
         for r in remotes:
             seen.add(r.key)
+            linked = r.associated is not False       # link up, or link status not reported
             st = self.stats.remotes.get(r.key)
             if st is None:
-                log.info("%s: remote %s (%s) is connected, RSSI %s dBm", self.dev.path, r.mac, r.ip, r.rssi)
-                st = self.stats.remotes[r.key] = RemoteState(r)
-            elif not st.online:
+                st = self.stats.remotes[r.key] = RemoteState(r, online=linked)
+                if linked:
+                    log.info("%s: remote %s (%s) is connected, RSSI %s dBm", self.dev.path, r.mac, r.ip, r.rssi)
+                else:
+                    log.warning("%s: remote %s (%s) is listed but its link is %s", self.dev.path, r.mac, r.ip,
+                                r.link_text)
+            elif linked and not st.online:
                 log.info("%s: remote %s (%s) is back, RSSI %s dBm", self.dev.path, r.mac, r.ip, r.rssi)
-            st.remote, st.online, st.last_seen = r, True, now
+            elif st.online and not linked:
+                log.warning("%s: remote %s (%s) link is %s", self.dev.path, r.mac, r.ip, r.link_text)
+            st.remote, st.online, st.listed = r, linked, True
+            if linked:
+                st.last_seen = now
         out: list[Update] = []
         for key, st in self.stats.remotes.items():
-            if key not in seen and st.online:
-                st.online = False
-                log.warning("%s: remote %s (%s) is no longer in the master's table", self.dev.path,
-                            st.remote.mac, st.remote.ip)
+            if key not in seen and st.listed:
+                if st.online:
+                    log.warning("%s: remote %s (%s) is no longer in the master's table", self.dev.path,
+                                st.remote.mac, st.remote.ip)
+                st.online = st.listed = False
             out += self._remote_updates(key, st, True)
         online = sum(st.online for st in self.stats.remotes.values())
         out += [Update(self.p("Remotes.Count"), len(self.stats.remotes), "DWord"),
@@ -323,7 +342,8 @@ class DevicePoller:
         numbers = {m: self.slot_name(n) for n, m in self.slots.items()}
         return [{"master": self.dev.path, "mac": s.remote.mac, "ip": s.remote.ip, "rssi": s.remote.rssi,
                  "tag": numbers.get(s.remote.mac, ""),
-                 "if_index": s.remote.if_index, "online": s.online,
+                 "if_index": s.remote.if_index, "online": s.online, "listed": s.listed,
+                 "link": s.remote.link_text,
                  "weak": warn is not None and s.remote.rssi is not None and s.remote.rssi < warn,
                  "last_seen": s.last_seen.astimezone().strftime("%H:%M:%S") if s.last_seen else "",
                  "poll_ok": self.stats.consecutive_failures == 0}

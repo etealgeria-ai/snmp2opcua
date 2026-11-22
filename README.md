@@ -227,7 +227,17 @@ Traps from addresses that aren't configured devices are still published under `G
 
 The gateway can poll devices over SNMP as well as receive their traps. The main use is reading signal strength from a **GE MDS Orbit master station** (for example the LN4 module in an Orbit MCR) for every remote radio connected to it.
 
-The master lists its remotes in the table `1.3.6.1.4.1.4130.10.2.5.1.2.2.1`. The row index is `<ifIndex>.<6 MAC octets>`, column `.2` is the remote's IP and column `.6` is its RSSI in dBm. These are the same table, columns and index parsing as the original pysnmp script. The gateway reads them with its own SNMP code (GETBULK for v2c, GETNEXT for v1), so pysnmp isn't needed. That matters because pysnmp 7 removed the synchronous `nextCmd` the script used.
+The master lists its remotes in `MDS-IF-LN-MIB::mIfLnStatusConnRemTable`, entry `1.3.6.1.4.1.4130.10.2.5.1.2.2.1`. The gateway reads three columns:
+
+| Column | MIB object | Syntax |
+|---|---|---|
+| `.2` | `mIfLnStatusConnRemIpAddress` | InetIpAddress: 4 octets (IPv4) or 16 (IPv6) |
+| `.4` | `mIfLnStatusConnRemLinkStatus` | LinkStatus: `associated(4)` means the link is up; `disassociated(5)`, `scanning(1)` and the rest mean it isn't |
+| `.6` | `mIfLnStatusConnRemRssi` | Integer32, RSSI in dBm |
+
+The row index is `INDEX { ifIndex, mIfLnStatusConnRemAddress }`. MacAddress has a fixed size, so the index is `<ifIndex>.<6 MAC octets>` with no length in front. A master that sends a length anyway is also understood.
+
+The IP and RSSI columns and the index parsing are the same as the original pysnmp script; link status is an addition. The gateway reads them with its own SNMP code (GETBULK for v2c, GETNEXT for v1), so pysnmp isn't needed. That matters because pysnmp 7 removed the synchronous `nextCmd` the script used.
 
 ```yaml
 channels:
@@ -251,11 +261,12 @@ channels:
 | Tag | Type | Meaning |
 |---|---|---|
 | `Radios.Master_LN4.Remote1` … `Remote50` | Int32 | RSSI in dBm of the radio with that number, e.g. `ns=2;s=Radios.Master_LN4.Remote7` |
-| `….Remote7_IP` / `_MAC` / `_Online` | String / String / Boolean | Which radio Remote7 is, and whether it's connected |
+| `….Remote7_IP` / `_MAC` / `_Online` | String / String / Boolean | Which radio Remote7 is, and whether its link is up |
 | `Radios.Master_LN4.Remotes.<MAC>.RSSI` | Int32 | The same RSSI, by MAC, e.g. `ns=2;s=Radios.Master_LN4.Remotes.00063D123456.RSSI` |
 | `….Remotes.<MAC>.IP` / `.MAC` / `.IfIndex` | String / String / Int32 | The remote's address and row index |
-| `….Remotes.<MAC>.Online` / `.LastSeen` | Boolean / DateTime | Whether it was in the last poll, and when it was last seen |
-| `….Remotes.Count` / `.OnlineCount` | UInt32 | Remotes ever seen / in the last poll |
+| `….Remotes.<MAC>.LinkStatus` | String | The master's link status for it: `associated`, `disassociated`, `scanning` … |
+| `….Remotes.<MAC>.Online` / `.LastSeen` | Boolean / DateTime | Whether its link was up in the last poll, and the last poll where it was |
+| `….Remotes.Count` / `.OnlineCount` | UInt32 | Remotes ever seen / online in the last poll |
 | `…._Polling.OK` / `.Error` / `.LastPoll` / `.DurationMs` / `.Failures` | | Poll status |
 
 **Remote numbering (Remote1 … Remote50):** SCADA screens can bind to fixed tags, so every radio keeps its number.
@@ -267,10 +278,23 @@ channels:
 
 How the tags behave:
 - A remote's folder is created the first time the master reports it.
+- A remote is online while the master lists it with link status `associated`. The master keeps a row for a while after its link drops (`mIfLnStatusConnRemTimeToLive`). In that time the remote shows `Online = 0` and its `LinkStatus` (for example `disassociated`), and its RSSI is the last value the master measured.
 - A remote that drops out of the table keeps its last RSSI and gets `Online = 0`.
+- If the master doesn't answer for the link status column (older firmware), a listed remote counts as online, and `LinkStatus` has Bad quality.
 - If the master stops answering, every polled tag keeps its last value with Bad quality and `_Polling.OK = 0`. The Radios view and Diagnostics then show the error with likely causes (community, the master's SNMP access list, UDP 161).
 
 You can change all of this in the window's **Stations** page instead of editing YAML. The settings are `community`, `port`, `snmp_version` (1 or 2c), `scan_rate_ms` (10 ms to 49 days), `timeout_ms`, `retries`, `max_repetitions` (the gateway halves it automatically if the master answers `tooBig`), `ge_orbit_remotes`, `rssi_warning_dbm`, `remote_tags`, `remote_tag_prefix` and `remote_slots`. Polled values are published in OPC UA server mode. In client mode they appear in the window and Diagnostics only.
+
+**Other values from the same MIB** can be polled as plain OID tags. The master's own LN interface is in `mIfLnStatusTable`, indexed by ifIndex (3 in these examples):
+
+```yaml
+        tags:
+          - {name: LN_LinkStatus,  address: ".1.3.6.1.4.1.4130.10.2.5.1.2.1.1.1.3",  data_type: Long}   # mIfLnLinkStatus
+          - {name: LN_Temperature, address: ".1.3.6.1.4.1.4130.10.2.5.1.2.1.1.9.3",  data_type: Long}   # mIfLnTemperature
+          - {name: LN_ActiveNic,   address: ".1.3.6.1.4.1.4130.10.2.5.1.2.1.1.34.3", data_type: Long}   # mIfLnActiveNic
+```
+
+TruthValue objects such as `mIfLnActiveNic` and `mIfLnStatusConnRemStatsAlarmed` are `true(1)` / `false(2)`. Poll them as Long. A Boolean tag treats any non-zero value as true, as KEPServerEX does, so `false(2)` would read as true.
 
 **The same report on the command line:**
 
@@ -333,7 +357,7 @@ snmp:
 python -m unittest discover -s tests -v
 ```
 
-The 93 tests cover:
+The 98 tests cover:
 
 - decoding a hand-encoded v1 packet and every SNMP value type
 - INFORM acknowledgements, community filtering and garbled packets
@@ -354,6 +378,7 @@ The 93 tests cover:
 - polling against a simulated GE Orbit master:
   - GET, GETNEXT and GETBULK walks, with `tooBig` back-off, timeouts and retries
   - the remote-table index and IP parsing, and a report identical to the original script's
+  - conformance with MDS-IF-LN-MIB: the table and column OIDs, the fixed-size MAC index (and a length-prefixed one), InetIpAddress as 4 or 16 octets, and link status deciding Online, with a fallback for masters that don't report it
   - remotes going offline, the master going down, value conversion and config checks
   - stable Remote1…RemoteN numbering: persistence across restarts, pins by MAC or IP, overflow, unused numbers
   - an end-to-end gateway run

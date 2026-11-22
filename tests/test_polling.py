@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_agent import ORBIT_TABLE, orbit_mib, start_agent  # noqa: E402
 
+from snmp2opcua import ge_orbit
 from snmp2opcua.config import load_config
 from snmp2opcua.gateway import Gateway
 from snmp2opcua.ge_orbit import Remote, format_report, ip_text, read_remotes, rssi_value, split_index
@@ -98,7 +99,7 @@ class OrbitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(rssi_value(VarBind("x", "x", "Octet String", "n/a")))
 
     async def test_read_remotes_matches_original_script(self):
-        agent, tr, port = await start_agent(orbit_mib(REMOTES, ip_as_octets=True))
+        agent, tr, port = await start_agent(orbit_mib(REMOTES, ip_as_octets=False))
         c = SnmpClient("127.0.0.1", "public", "2c", port, timeout=0.5)
         try:
             remotes = await read_remotes(c)
@@ -154,6 +155,87 @@ class ConvertTests(unittest.TestCase):
                         (vb("NoSuchObject", None), "Long"), (vb("Octet String", "abc"), "Long")]:
             with self.assertRaises(ValueError):
                 convert(bad, dt)
+
+
+class MibConformanceTests(unittest.IsolatedAsyncioTestCase):
+    """MDS-IF-LN-MIB::mIfLnStatusConnRemTable as the GE MDS Orbit master defines it."""
+
+    def test_oids_match_the_mib(self):
+        # mdsInterfaces = 1.3.6.1.4.1.4130.10.2; mdsIfLnMIB = .5; mIfLnMIBObjects = .1; mIfLnStatus = .2;
+        # mIfLnStatusConnRemTable = .2; entry = .1
+        self.assertEqual(ge_orbit.BASE_TABLE, "1.3.6.1.4.1.4130.10.2" + ".5.1.2.2.1")
+        self.assertEqual((ge_orbit.IP_COL[-2:], ge_orbit.LINK_COL[-2:], ge_orbit.RSSI_COL[-2:]), (".2", ".4", ".6"))
+        self.assertEqual(ge_orbit.LINK_STATUS[ge_orbit.ASSOCIATED], "associated")
+        self.assertEqual(ge_orbit.LINK_STATUS[5], "disassociated")
+
+    def test_index_and_address_forms(self):
+        self.assertEqual(split_index("3.0.6.61.18.52.86"), (3, "00:06:3D:12:34:56"))     # fixed-size MacAddress
+        self.assertEqual(split_index("3.6.0.6.61.18.52.86"), (3, "00:06:3D:12:34:56"))   # length sent anyway
+        self.assertIsNone(split_index("3.0.6.61.18.52.86.1"))                            # not this table's index
+        self.assertIsNone(split_index("3.7.0.6.61.18.52.86"))
+        v6 = bytes.fromhex("fd000000000000000000000000000005")
+        self.assertEqual(ip_text(VarBind("x", "x", "Octet String", v6.hex(":"), v6)), "fd00::5")
+        mapped = bytes(10) + b"\xff\xff" + bytes([10, 0, 0, 5])
+        self.assertEqual(ip_text(VarBind("x", "x", "Octet String", mapped.hex(":"), mapped)), "10.0.0.5")
+        r = Remote("00:06:3D:12:34:56", 3, "10.0.0.5", -70, 5)
+        self.assertEqual((r.link_text, r.associated), ("disassociated", False))
+        self.assertEqual((Remote("00:00:00:00:00:01", 1, "", -70).associated, Remote("00:00:00:00:00:01", 1, "", -70, 9).link_text),
+                         (None, "unknown(9)"))
+
+    async def test_read_remotes_with_mib_types(self):
+        remotes = [("00:06:3D:12:34:56", "10.10.1.21", -72, 4), ("00:06:3D:12:34:57", "fd00::22", -97, 5)]
+        for length_prefixed in (False, True):
+            _agent, tr, port = await start_agent(orbit_mib(remotes, length_prefixed=length_prefixed))
+            c = SnmpClient("127.0.0.1", "public", "2c", port, timeout=0.5)
+            try:
+                got = await read_remotes(c)
+            finally:
+                c.close()
+                tr.close()
+            self.assertEqual([(r.mac, r.ip, r.rssi, r.link_text) for r in got],
+                             [("00:06:3D:12:34:56", "10.10.1.21", -72, "associated"),
+                              ("00:06:3D:12:34:57", "fd00::22", -97, "disassociated")])
+
+    async def test_link_status_decides_online(self):
+        remotes = [REMOTES[0] + (4,), REMOTES[1] + (5,), REMOTES[2] + (4,)]
+        agent, tr, port = await start_agent(orbit_mib(remotes))
+        dev = build_devices([{"name": "Radios", "devices": [master_device(port)]}])[0]
+        p = DevicePoller(dev)
+        try:
+            v = by_rest(await p.poll_once())
+            self.assertEqual(v["Remotes.00063D123457.Online"], (False, True))       # listed, link down
+            self.assertEqual(v["Remotes.00063D123457.LinkStatus"], ("disassociated", True))
+            self.assertEqual(v["Remotes.00063D123457.RSSI"], (-97, True))
+            self.assertEqual(v["Remotes.00063D123457.LastSeen"][1], False)           # never seen linked
+            self.assertEqual(v["Remotes.00063D123456.LinkStatus"], ("associated", True))
+            self.assertEqual((v["Remotes.Count"], v["Remotes.OnlineCount"]), ((3, True), (2, True)))
+            slot = {r["mac"]: r["tag"] for r in p.radios()}["00:06:3D:12:34:57"]
+            self.assertEqual(v[f"{slot}_Online"], (False, True))
+            row = next(r for r in p.radios() if r["mac"] == "00:06:3D:12:34:57")
+            self.assertEqual((row["online"], row["listed"], row["link"]), (False, True, "disassociated"))
+
+            agent.mib = orbit_mib([REMOTES[0] + (4,), REMOTES[1] + (4,)])         # link back; third ages out
+            v = by_rest(await p.poll_once())
+            self.assertEqual(v["Remotes.00063D123457.Online"], (True, True))
+            self.assertTrue(v["Remotes.00063D123457.LastSeen"][1])
+            self.assertEqual(v["Remotes.00063DABCDEF.Online"], (False, True))
+            row = next(r for r in p.radios() if r["mac"] == "00:06:3D:AB:CD:EF")
+            self.assertEqual((row["listed"], row["link"]), (False, "associated"))   # last known link state
+        finally:
+            p.close()
+            tr.close()
+
+    async def test_master_without_link_status(self):
+        _agent, tr, port = await start_agent(orbit_mib(REMOTES, link=False))
+        dev = build_devices([{"name": "Radios", "devices": [master_device(port)]}])[0]
+        p = DevicePoller(dev)
+        try:
+            v = by_rest(await p.poll_once())
+            self.assertEqual(v["Remotes.OnlineCount"], (3, True))                   # listed counts as online
+            self.assertEqual(v["Remotes.00063D123456.LinkStatus"], ("", False))     # not reported: Bad quality
+        finally:
+            p.close()
+            tr.close()
 
 
 class PollerTests(unittest.IsolatedAsyncioTestCase):
