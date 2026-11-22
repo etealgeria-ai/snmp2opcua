@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - reported in main()
 from .diagnostics import STATUS_LABEL, Check, report_text, run_diagnostics, summarize
 from .gui_controller import GatewayController, TrapRequest, parse_varbind_lines
 from .snmp_driver import DeviceDef, EventsAddress
+from . import stations as stations_mod
 from .ge_orbit import Remote, format_report
 from .tag_csv import TagCsvError, read_tags, write_tags
 from .usm import AUTH_PROTOCOLS, PRIV_PROTOCOLS, UsmUser
@@ -90,10 +91,16 @@ class GatewayApp:
         self.tag_devices: list[DeviceDef] = []
         self.dynamic_types: dict[str, str] = {}          # polled tags not in the config (e.g. remote radios)
         self.radios: dict[str, dict] = {}                 # master path -> last "radios" payload
+        self.station_list: list[stations_mod.Station] = []
+        self.station_current: stations_mod.Station | None = None   # None = adding a new station
+        self.station_dirty = False
+        self.station_loading = False
+        self.station_testing = False
 
         self._setup_style()
         self._build()
         self._load_config_into_ui(first=True)
+        self._refresh_stations()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(150, self._poll)
         root.after(1000, self._tick)
@@ -205,6 +212,7 @@ class GatewayApp:
         self.tab_devices = self._build_devices_tab()
         self.tab_rejected = self._build_rejected_tab()
         self.tab_diag = self._build_diag_tab()
+        self.tab_stations = self._build_stations_tab()
         self.tab_test = self._build_test_tab()
         self.tab_config = self._build_config_tab()
         self.tab_log = self._build_log_tab()
@@ -624,6 +632,300 @@ class GatewayApp:
         self._set_diag_detail([("Select a check to see what was found and how to fix it.", "")])
         return tab
 
+    # ------------------------------------------------------------------ stations tab
+    STATION_FIELDS = ["channel", "name", "ip", "community", "version", "port", "scan_rate_s", "timeout_ms",
+                      "retries", "max_repetitions", "rssi_warning_dbm"]
+    STATION_FLAGS = ["rssi_enabled", "receive_traps", "auto_create_tags"]
+
+    def _build_stations_tab(self) -> ttk.Frame:
+        tab = ttk.Frame(self.nb, padding=(0, 10, 0, 0))
+        self.nb.add(tab, text="Stations")
+        tab.columnconfigure(1, weight=1)
+        tab.rowconfigure(0, weight=1)
+
+        # left: the list of GE master stations
+        left = ttk.Frame(tab)
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 16))
+        ttk.Label(left, text="GE MDS Orbit master stations", style="Head.TLabel").pack(side="top", anchor="w")
+        lbox = ttk.Frame(left)
+        lbox.pack(side="top", fill="both", expand=True, pady=(6, 6))
+        self.station_tree = self._make_tree(lbox, [("station", "Station", 190, True), ("ip", "IP address", 120, False)])
+        self.station_tree.bind("<<TreeviewSelect>>", self._on_station_select)
+        btns = ttk.Frame(left)
+        btns.pack(side="top", fill="x")
+        ttk.Button(btns, text="Add station", command=self.add_station).pack(side="left")
+        self.btn_remove_station = ttk.Button(btns, text="Remove", command=self.remove_station)
+        self.btn_remove_station.pack(side="left", padx=(6, 0))
+
+        # right: the form
+        right = ttk.Frame(tab)
+        right.grid(row=0, column=1, sticky="nsew")
+        self.station_title = ttk.Label(right, text="", style="Head.TLabel")
+        self.station_title.pack(side="top", anchor="w", pady=(0, 8))
+        self.sv: dict[str, tk.StringVar] = {k: tk.StringVar() for k in self.STATION_FIELDS}
+        self.sb: dict[str, tk.BooleanVar] = {k: tk.BooleanVar() for k in self.STATION_FLAGS}
+        for var in [*self.sv.values(), *self.sb.values()]:
+            var.trace_add("write", lambda *_: self._mark_station_dirty())
+        self.station_entries: dict[str, ttk.Entry | ttk.Combobox] = {}
+
+        def section(title: str) -> ttk.Labelframe:
+            f = ttk.Labelframe(right, text=title, padding=(12, 8))
+            f.pack(side="top", fill="x", pady=(0, 10))
+            f.columnconfigure(1, weight=1)
+            return f
+
+        def row(parent, r: int, label: str, key: str, width: int = 24, hint: str = "", combo=None, show=""):
+            ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=(0, 12), pady=3)
+            if combo is not None:
+                w: ttk.Entry | ttk.Combobox = ttk.Combobox(parent, textvariable=self.sv[key], width=width,
+                                                           values=combo[0], state=combo[1])
+            else:
+                w = ttk.Entry(parent, textvariable=self.sv[key], width=width, show=show)
+            w.grid(row=r, column=1, sticky="w", pady=3)
+            if hint:
+                ttk.Label(parent, text=hint, style="Small.TLabel").grid(row=r, column=2, sticky="w", padx=(10, 0))
+            self.station_entries[key] = w
+            return w
+
+        st = section("Station")
+        self.channel_combo = row(st, 0, "Channel", "channel", combo=([], "normal"),
+                                 hint="Folder in OPC UA, e.g. Radios")
+        row(st, 1, "Name", "name", hint="Becomes the device folder, e.g. Radios.Master_LN4")
+        row(st, 2, "IP address", "ip", width=18, hint="The master station's address, e.g. 192.168.1.10")
+
+        po = section("SNMP polling")
+        self.community_entry_st = row(po, 0, "Read community", "community", show="•")
+        self.st_show_comm = tk.BooleanVar(value=False)
+        ttk.Checkbutton(po, text="Show", variable=self.st_show_comm,
+                        command=lambda: self.community_entry_st.configure(show="" if self.st_show_comm.get() else "•")
+                        ).grid(row=0, column=2, sticky="w", padx=(10, 0))
+        row(po, 1, "SNMP version", "version", width=6, combo=(["1", "2c"], "readonly"))
+        row(po, 2, "Port", "port", width=8, hint="Default 161")
+        row(po, 3, "Scan rate (seconds)", "scan_rate_s", width=8, hint="How often to read RSSI; 0.01 s to 49 days")
+        row(po, 4, "Timeout (ms)", "timeout_ms", width=8)
+        row(po, 5, "Retries", "retries", width=8)
+        row(po, 6, "Max repetitions", "max_repetitions", width=8, hint="Rows per GETBULK request")
+
+        sg = section("Signal")
+        ttk.Checkbutton(sg, text="Warn when a remote's RSSI is below", variable=self.sb["rssi_enabled"],
+                        command=self._update_station_widgets).grid(row=0, column=0, sticky="w", pady=3)
+        rssi = ttk.Entry(sg, textvariable=self.sv["rssi_warning_dbm"], width=8)
+        rssi.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(sg, text="dBm", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(6, 0))
+        self.station_entries["rssi_warning_dbm"] = rssi
+
+        tr = section("Traps")
+        ttk.Checkbutton(tr, text="Also receive traps from this station", variable=self.sb["receive_traps"]
+                        ).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(tr, text="Create coldStart, warmStart, linkUp and linkDown tags",
+                        variable=self.sb["auto_create_tags"]).grid(row=1, column=0, sticky="w", pady=2)
+
+        actions = ttk.Frame(right)
+        actions.pack(side="top", fill="x", pady=(4, 0))
+        self.btn_station_test = ttk.Button(actions, text="Test connection", command=self.test_station)
+        self.btn_station_test.pack(side="left")
+        ttk.Button(actions, text="Save and restart", style="Accent.TButton",
+                   command=lambda: self.save_station(restart=True)).pack(side="right")
+        ttk.Button(actions, text="Save", command=self.save_station).pack(side="right", padx=(0, 6))
+        ttk.Button(actions, text="Revert", command=self.revert_station).pack(side="right", padx=(0, 6))
+        self.station_msg = ttk.Label(right, text="", style="Muted.TLabel", wraplength=620, justify="left")
+        self.station_msg.pack(side="top", anchor="w", pady=(10, 0))
+        return tab
+
+    def _mark_station_dirty(self) -> None:
+        if not self.station_loading:
+            self.station_dirty = True
+
+    def _update_station_widgets(self) -> None:
+        self.station_entries["rssi_warning_dbm"].configure(state="normal" if self.sb["rssi_enabled"].get()
+                                                           else "disabled")
+        self.btn_remove_station.configure(state="normal" if self.station_current is not None else "disabled")
+
+    def _refresh_stations(self, keep: str | None = None) -> None:
+        try:
+            text = self.ctl.read_text()
+            self.station_list = stations_mod.list_stations(text)
+            channels = stations_mod.channel_names(text)
+        except Exception as exc:
+            self.station_list, channels = [], []
+            self._station_message(f"Can't read the configuration: {exc}", error=True)
+        tree = self.station_tree
+        tree.delete(*tree.get_children())
+        for i, stn in enumerate(self.station_list):
+            tree.insert("", "end", iid=f"st{i}", values=(stn.path, stn.ip))
+        self.channel_combo.configure(values=sorted(set(channels) | {stations_mod.DEFAULT_CHANNEL}))
+        target = next((i for i, x in enumerate(self.station_list) if x.path == keep), None)
+        if target is None and self.station_list and keep != "__new__":
+            target = 0
+        if target is not None:
+            tree.selection_set(f"st{target}")
+            self._load_station(self.station_list[target])
+        else:
+            self.add_station(force=True)
+
+    def _load_station(self, stn: stations_mod.Station | None) -> None:
+        self.station_loading = True
+        try:
+            src = stn or stations_mod.new_station(self.ctl.read_text())
+            self.station_current = stn
+            values = {"channel": src.channel, "name": src.name, "ip": src.ip, "community": src.community,
+                      "version": src.version, "port": str(src.port), "scan_rate_s": f"{src.scan_rate_ms / 1000:g}",
+                      "timeout_ms": str(src.timeout_ms), "retries": str(src.retries),
+                      "max_repetitions": str(src.max_repetitions),
+                      "rssi_warning_dbm": str(src.rssi_warning_dbm if src.rssi_warning_dbm is not None
+                                              else stations_mod.DEFAULT_RSSI_WARNING)}
+            for k, v in values.items():
+                self.sv[k].set(v)
+            self.sb["rssi_enabled"].set(src.rssi_warning_dbm is not None)
+            self.sb["receive_traps"].set(src.receive_traps)
+            self.sb["auto_create_tags"].set(src.auto_create_tags)
+        finally:
+            self.station_loading = False
+        self.station_dirty = False
+        self.station_title.configure(text=f"Station {stn.path}" if stn else "New station")
+        self._station_message("Fill in the master station's details, then Save." if stn is None else "")
+        self._update_station_widgets()
+
+    def _station_message(self, text: str, error: bool = False) -> None:
+        self.station_msg.configure(text=text, style="Error.TLabel" if error else "Muted.TLabel")
+
+    def _confirm_discard(self) -> bool:
+        if not self.station_dirty:
+            return True
+        name = self.station_current.path if self.station_current else "the new station"
+        return bool(messagebox.askokcancel("Stations", f"Discard your changes to {name}?", parent=self.root))
+
+    def _on_station_select(self, _event=None) -> None:
+        if self.station_loading:
+            return
+        sel = self.station_tree.selection()
+        if not sel:
+            return
+        stn = self.station_list[int(sel[0][2:])]
+        if self.station_current is not None and stn.path == self.station_current.path and not self.station_dirty:
+            return
+        if not self._confirm_discard():
+            return
+        self._load_station(stn)
+
+    def add_station(self, force: bool = False) -> None:
+        if not force and not self._confirm_discard():
+            return
+        self.station_loading = True
+        self.station_tree.selection_set()
+        self.station_loading = False
+        self._load_station(None)
+        self.station_entries["ip"].focus_set()
+
+    def revert_station(self) -> None:
+        self._load_station(self.station_current)
+
+    def _form_values(self) -> dict:
+        v: dict = {k: var.get() for k, var in self.sv.items()}
+        v.update({k: var.get() for k, var in self.sb.items()})
+        return v
+
+    def _editor_blocks(self) -> bool:
+        if self.editor.edit_modified():
+            messagebox.showinfo("Stations", "The Configuration tab has unsaved edits. Save or reload them there "
+                                "first, so the two don't overwrite each other.", parent=self.root)
+            return True
+        return False
+
+    def save_station(self, restart: bool = False) -> None:
+        if self._editor_blocks():
+            return
+        text = self.ctl.read_text()
+        stn, problems = stations_mod.parse_form(self._form_values(), self.station_current, text)
+        if problems or stn is None:
+            self._station_message("Not saved. " + " ".join(m for _, m in problems), error=True)
+            if problems and problems[0][0] in self.station_entries:
+                self.station_entries[problems[0][0]].focus_set()
+            return
+        try:
+            new_text = stations_mod.save_station(text, stn, self.station_current)
+            self.ctl.save_text(new_text)
+        except (ValueError, OSError) as exc:
+            self._station_message(f"Not saved: {exc}", error=True)
+            return
+        self.station_dirty = False
+        self._load_config_into_ui()
+        self._refresh_stations(keep=stn.path)
+        if restart:
+            self._station_message(f"Saved {stn.path}. Restarting the gateway…")
+            if self.ctl.running:
+                self.restart_pending = True
+                self.stop()
+            else:
+                self.start()
+        else:
+            self._station_message(f"Saved {stn.path} to {self.ctl.config_path.name} (previous version kept as .bak)."
+                                  + (" Restart the gateway to apply it." if self.ctl.running else ""))
+
+    def remove_station(self) -> None:
+        stn = self.station_current
+        if stn is None or self._editor_blocks():
+            return
+        if not messagebox.askokcancel("Remove station", f"Remove {stn.path} ({stn.ip}) from the configuration? "
+                                      "Its tags and history stop updating after a restart.", parent=self.root):
+            return
+        try:
+            self.ctl.save_text(stations_mod.delete_station(self.ctl.read_text(), stn))
+        except (ValueError, OSError) as exc:
+            self._station_message(f"Not removed: {exc}", error=True)
+            return
+        self.station_dirty = False
+        self._load_config_into_ui()
+        self._refresh_stations()
+        self._station_message(f"Removed {stn.path}." + (" Restart the gateway to apply it." if self.ctl.running
+                                                         else ""))
+
+    def test_station(self) -> None:
+        if self.station_testing:
+            return
+        stn, problems = stations_mod.parse_form(self._form_values(), self.station_current, self.ctl.read_text())
+        problems = [p for p in problems if p[0] not in ("name", "channel")]
+        if problems:
+            self._station_message("Can't test yet. " + " ".join(m for _, m in problems), error=True)
+            return
+        v = self._form_values()
+        self.station_testing = True
+        self.btn_station_test.configure(state="disabled")
+        self._station_message(f"Asking {v['ip']} for its remotes…")
+
+        def work() -> None:
+            import asyncio
+
+            from .ge_orbit import read_remotes
+            from .snmp_client import SnmpClient
+
+            async def probe():
+                client = SnmpClient(v["ip"].strip(), v["community"], v["version"], int(v["port"]),
+                                    int(v["timeout_ms"]) / 1000, int(v["retries"]))
+                try:
+                    return await read_remotes(client, int(v["max_repetitions"]))
+                finally:
+                    client.close()
+            try:
+                remotes = asyncio.run(probe())
+                if remotes:
+                    rs = [r.rssi for r in remotes if r.rssi is not None]
+                    rng = f", RSSI {max(rs)} to {min(rs)} dBm" if rs else ""
+                    result = (True, f"Connected to {v['ip']}: {len(remotes)} remote radios{rng}.")
+                else:
+                    result = (True, f"Connected to {v['ip']}, but it reports no remote radios.")
+            except Exception as exc:
+                result = (False, f"No usable answer from {v['ip']}:{v['port']} ({exc}). Check the IP address and "
+                                 f"read community, the master's SNMP access list, and that UDP {v['port']} is open.")
+            self.ctl.events.put(("station_test", result))
+
+        threading.Thread(target=work, name="station-test", daemon=True).start()
+
+    def _on_station_test(self, ok: bool, message: str) -> None:
+        self.station_testing = False
+        self.btn_station_test.configure(state="normal")
+        self._station_message(message, error=not ok)
+
     # ------------------------------------------------------------------ test tab
     def _build_test_tab(self) -> ttk.Frame:
         tab = ttk.Frame(self.nb, padding=(16, 14, 16, 14))
@@ -954,6 +1256,8 @@ class GatewayApp:
             self._on_tags(payload)
         elif kind == "radios":
             self._on_radios(payload)
+        elif kind == "station_test":
+            self._on_station_test(*payload)
 
     def _tick(self) -> None:
         stats = self.ctl.stats()

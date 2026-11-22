@@ -130,6 +130,10 @@ On Windows you can also double-click `run_gui.pyw`, which uses the `config.yaml`
 - **Radios:** the remote radios of each GE MDS Orbit master: MAC, IP, RSSI, IfIndex, status and last seen, weakest signal first.
   - Remotes below `rssi_warning_dbm` are tinted amber and labelled "weak signal". Offline remotes are tinted red and labelled.
   - *Copy as report* gives the same table as the original pysnmp script.
+- **Stations:** a form for GE MDS Orbit master stations, so you can change the settings without editing YAML.
+  - Fields: channel, name, **IP address**, read community (masked, with *Show*), SNMP version, port, scan rate, timeout, retries, max repetitions, the RSSI warning level, and whether to receive traps and create the standard trap tags.
+  - *Add station* and *Remove* manage the list. *Test connection* polls the master with the values on screen and reports how many remotes answered and their RSSI range.
+  - *Save* rewrites only the values you changed in `config.yaml`, keeping your comments and layout. It validates first, with the same messages as the manuals (e.g. "Invalid IP address…", "The rate must be within the range of 10 milliseconds and 49 days."), and keeps the previous file as `.bak`. *Save and restart* applies the change straight away.
 - **Rejected:** every refused or unreadable packet with the exact reason, e.g. a wrong community, an unknown v3 user, a failed authentication or decryption, or a stale trap.
 - **Diagnostics:** health checks that run when you open the tab or press *Run checks*. Each result is marked Problem, Warning, OK or Info, with a "How to fix" note where needed. *Copy report* and *Save report…* produce a plain-text report for a ticket or email, and it never contains keys or passwords. The checks cover:
   - **Configuration:** whether it loads, the SNMP versions accepted, and the v3 users
@@ -240,7 +244,7 @@ How the tags behave:
 - A remote that drops out of the table keeps its last RSSI and gets `Online = 0`.
 - If the master stops answering, every polled tag keeps its last value with Bad quality and `_Polling.OK = 0`. The Radios view and Diagnostics then show the error with likely causes (community, the master's SNMP access list, UDP 161).
 
-The settings are `community`, `port`, `snmp_version` (1 or 2c), `scan_rate_ms` (10 ms to 49 days), `timeout_ms`, `retries`, `max_repetitions` (the gateway halves it automatically if the master answers `tooBig`), `ge_orbit_remotes` and `rssi_warning_dbm`. Polled values are published in OPC UA server mode. In client mode they appear in the window and Diagnostics only.
+You can change all of this in the window's **Stations** page instead of editing YAML. The settings are `community`, `port`, `snmp_version` (1 or 2c), `scan_rate_ms` (10 ms to 49 days), `timeout_ms`, `retries`, `max_repetitions` (the gateway halves it automatically if the master answers `tooBig`), `ge_orbit_remotes` and `rssi_warning_dbm`. Polled values are published in OPC UA server mode. In client mode they appear in the window and Diagnostics only.
 
 **The same report on the command line:**
 
@@ -303,7 +307,7 @@ snmp:
 python -m unittest discover -s tests -v
 ```
 
-The 75 tests cover:
+The 89 tests cover:
 
 - decoding a hand-encoded v1 packet and every SNMP value type
 - INFORM acknowledgements, community filtering and garbled packets
@@ -326,6 +330,11 @@ The 75 tests cover:
   - the remote-table index and IP parsing, and a report identical to the original script's
   - remotes going offline, the master going down, value conversion and config checks
   - an end-to-end gateway run
+- the Stations page logic:
+  - validation messages
+  - edits that change only the edited lines and keep every comment
+  - adding, moving, renaming and removing stations
+  - the YAML editor's round trips on the real config file
 
 They don't need asyncua.
 
@@ -341,6 +350,8 @@ snmp2opcua/
   snmp_client.py   SNMP v1/v2c polling client (GET, GETNEXT, GETBULK, walk)
   poller.py        per-device polling: OID tags, GE Orbit remotes, poll status tags
   ge_orbit.py      GE MDS Orbit remote table (RSSI/IP per remote) + command-line report
+  stations.py      Stations page logic: list, validate and save GE master stations
+  yaml_edit.py     edits config.yaml in place, keeping comments and layout
   snmpv3.py        SNMPv3 messages: auth, timeliness, decrypt, discovery Reports, inform Responses
   usm.py           USM crypto: key localization, HMAC, DES/AES
   receiver.py      UDP and TCP trap listeners, filtering, stats
