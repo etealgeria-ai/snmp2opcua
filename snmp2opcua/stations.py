@@ -34,6 +34,8 @@ class Station:
     rssi_warning_dbm: int | None = None
     receive_traps: bool = True
     auto_create_tags: bool = True
+    remote_tags: int = 50
+    remote_tag_prefix: str = "Remote"
     # where it lives in config.yaml (None for a new station)
     ci: int | None = None
     di: int | None = None
@@ -63,7 +65,9 @@ def list_stations(text: str) -> list[Station]:
                 max_repetitions=int(p.get("max_repetitions", 20)),
                 rssi_warning_dbm=None if p.get("rssi_warning_dbm") is None else int(p["rssi_warning_dbm"]),
                 receive_traps=bool((d.get("trap") or {}).get("enabled", True)),
-                auto_create_tags=bool(d.get("auto_create_tags", True)), ci=ci, di=di, raw=dict(d)))
+                auto_create_tags=bool(d.get("auto_create_tags", True)),
+                remote_tags=int(p.get("remote_tags", 50)), remote_tag_prefix=str(p.get("remote_tag_prefix", "Remote")),
+                ci=ci, di=di, raw=dict(d)))
     return out
 
 
@@ -135,6 +139,12 @@ def parse_form(values: dict, original: Station | None, text: str) -> tuple[Stati
     timeout_ms = _int(values.get("timeout_ms", ""), "timeout_ms", 50, 60000, "Timeout", problems)
     retries = _int(values.get("retries", ""), "retries", 0, 10, "Retries", problems)
     max_reps = _int(values.get("max_repetitions", ""), "max_repetitions", 1, 200, "Max repetitions", problems)
+    remote_tags = _int(values.get("remote_tags", "50"), "remote_tags", 0, 1000, "Number of RSSI tags", problems)
+    prefix = str(values.get("remote_tag_prefix", "Remote")).strip()
+    try:
+        _check_name("tag", prefix)
+    except DriverConfigError as exc:
+        problems.append(("remote_tag_prefix", str(exc)))
     rssi = None
     if values.get("rssi_enabled"):
         rssi = _int(values.get("rssi_warning_dbm", ""), "rssi_warning_dbm", -200, 0, "RSSI warning", problems)
@@ -150,9 +160,9 @@ def parse_form(values: dict, original: Station | None, text: str) -> tuple[Stati
     if problems:
         return None, problems
     assert port is not None and scan_rate_ms is not None and timeout_ms is not None
-    assert retries is not None and max_reps is not None
+    assert retries is not None and max_reps is not None and remote_tags is not None
     st = Station(channel, name, ip, community, version, port, scan_rate_ms, timeout_ms, retries, max_reps, rssi,
-                 bool(values.get("receive_traps")), bool(values.get("auto_create_tags")),
+                 bool(values.get("receive_traps")), bool(values.get("auto_create_tags")), remote_tags, prefix,
                  original.ci if original else None, original.di if original else None,
                  dict(original.raw) if original else {})
     return st, []
@@ -164,6 +174,8 @@ def _polling(st: Station) -> dict:
          "ge_orbit_remotes": True}
     if st.rssi_warning_dbm is not None:
         p["rssi_warning_dbm"] = st.rssi_warning_dbm
+    p["remote_tags"] = st.remote_tags
+    p["remote_tag_prefix"] = st.remote_tag_prefix
     return p
 
 
@@ -205,7 +217,8 @@ def save_station(text: str, st: Station, original: Station | None) -> str:
             text = set_in(text, base + ["trap", "enabled"], st.receive_traps)
         dev_version = str(raw.get("snmp_version", "2c")).lstrip("v")
         effective = {"community": "public", "port": 161, "scan_rate_ms": 10000, "timeout_ms": 2000, "retries": 1,
-                     "max_repetitions": 20, "ge_orbit_remotes": True,
+                     "max_repetitions": 20, "ge_orbit_remotes": True, "remote_tags": 50,
+                     "remote_tag_prefix": "Remote",
                      "snmp_version": dev_version if dev_version in ("1", "2c") else None}
         effective.update(rawp)
         for key, value in _polling(st).items():
@@ -227,6 +240,14 @@ def save_station(text: str, st: Station, original: Station | None) -> str:
     if target is None:
         return append_to(text, ["channels"], {"name": st.channel, "devices": [device]})
     return append_to(text, ["channels", target, "devices"], device)
+
+
+def lock_numbers(text: str, st: Station, slots: dict[int, str]) -> str:
+    """Pin the current Remote numbering (number -> MAC) for a station, so it never changes."""
+    if st.ci is None or st.di is None:
+        raise ValueError("Save the station first")
+    pins = {int(k): v for k, v in sorted(slots.items())}
+    return set_in(text, ["channels", st.ci, "devices", st.di, "polling", "remote_slots"], pins)
 
 
 def delete_station(text: str, st: Station) -> str:

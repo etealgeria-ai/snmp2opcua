@@ -187,9 +187,11 @@ class PollerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(v["Remotes.00063D123456.RSSI"], (-72, False))
             self.assertEqual(p.stats.failures, 1)
             self.assertFalse(p.radios()[0]["poll_ok"])
-            self.assertEqual([t[0].split(".", 2)[2] for t in p.static_tags()],
-                             ["_Polling.OK", "_Polling.Error", "_Polling.LastPoll", "_Polling.DurationMs",
-                              "_Polling.Failures", "Remotes.Count", "Remotes.OnlineCount"])
+            names = [t[0].split(".", 2)[2] for t in p.static_tags()]
+            self.assertEqual(names[:7], ["_Polling.OK", "_Polling.Error", "_Polling.LastPoll", "_Polling.DurationMs",
+                                         "_Polling.Failures", "Remotes.Count", "Remotes.OnlineCount"])
+            self.assertEqual(names[7:11], ["Remote1", "Remote1_IP", "Remote1_MAC", "Remote1_Online"])
+            self.assertEqual((len(names), names[-1]), (7 + 50 * 4, "Remote50_Online"))
         finally:
             p.close()
 
@@ -209,6 +211,91 @@ class PollerTests(unittest.IsolatedAsyncioTestCase):
             tr.close()
         self.assertEqual((v["A"], v["Missing"], v["B"], v["_Polling.OK"]),
                          (("LN4-MASTER", True), (0, False), (123456, True), (True, True)))
+
+
+class RemoteNumberingTests(unittest.IsolatedAsyncioTestCase):
+    async def poller(self, port, state, **poll):
+        dev = build_devices([{"name": "Radios", "devices": [master_device(port, **poll)]}])[0]
+        return DevicePoller(dev, state_file=state)
+
+    async def test_stable_numbers_pins_and_persistence(self):
+        agent, tr, port = await start_agent(orbit_mib(REMOTES))
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "slots.json"
+            p = await self.poller(port, state)
+            try:
+                v = by_rest(await p.poll_once())
+                self.assertEqual([v[f"Remote{i}_MAC"][0] for i in (1, 2, 3)], [m for m, _, _ in REMOTES])
+                self.assertEqual((v["Remote2"], v["Remote2_IP"], v["Remote2_Online"]),
+                                 ((-97, True), ("10.10.1.22", True), (True, True)))
+                self.assertEqual((v["Remote4"], v["Remote4_MAC"], v["Remote50_IP"]),
+                                 ((0, False), ("", False), ("", False)))           # unused: Bad quality
+                self.assertEqual({r["mac"]: r["tag"] for r in p.radios()}["00:06:3D:12:34:57"], "Remote2")
+
+                agent.mib = orbit_mib([REMOTES[0], REMOTES[2]])                    # Remote2 goes offline
+                v = by_rest(await p.poll_once())
+                self.assertEqual((v["Remote2_MAC"][0], v["Remote2_Online"][0], v["Remote2"][0]),
+                                 ("00:06:3D:12:34:57", False, -97))                # keeps its number
+                agent.mib = orbit_mib(REMOTES + [("00:06:3D:00:00:99", "10.10.1.99", -70)])
+                v = by_rest(await p.poll_once())
+                self.assertEqual((v["Remote2_Online"][0], v["Remote4_MAC"][0]), (True, "00:06:3D:00:00:99"))
+            finally:
+                p.close()
+
+            # after a restart the same radios get the same numbers, even before they're seen
+            agent.mib = orbit_mib([REMOTES[2]])
+            p2 = await self.poller(port, state)
+            try:
+                v = by_rest(await p2.poll_once())
+                self.assertEqual((v["Remote3_MAC"][0], v["Remote3"][0]), ("00:06:3D:AB:CD:EF", -64))
+                self.assertEqual((v["Remote1_MAC"], v["Remote1"]), (("00:06:3D:12:34:56", True), (0, False)))
+            finally:
+                p2.close()
+
+            # pins by MAC and IP move radios to fixed numbers and reserve them
+            agent.mib = orbit_mib(REMOTES)
+            p3 = await self.poller(port, state, remote_tags=10, remote_tag_prefix="Radio",
+                                   remote_slots={"Radio9": "00063DABCDEF", 1: "10.10.1.22", 5: "00:06:3D:77:77:77"})
+            try:
+                v = by_rest(await p3.poll_once())
+                self.assertEqual(v["Radio9_MAC"][0], "00:06:3D:AB:CD:EF")
+                self.assertEqual((v["Radio1_IP"][0], v["Radio1"][0]), ("10.10.1.22", -97))
+                self.assertEqual(v["Radio5_MAC"][0], "")                            # reserved for its pin
+                self.assertNotIn("Remote1", v)
+                self.assertEqual(sorted(p3.slots), [1, 2, 4, 9])
+                self.assertEqual(p3.slots[4], "00:06:3D:00:00:99")                  # remembered from the last run
+                self.assertEqual(p3.slots[2], "00:06:3D:12:34:56")                  # bumped off 1 by the pin
+            finally:
+                p3.close()
+        tr.close()
+
+    async def test_overflow_and_disabled(self):
+        agent, tr, port = await start_agent(orbit_mib(REMOTES))
+        p = await self.poller(port, None, remote_tags=2)
+        try:
+            await p.poll_once()
+            self.assertEqual(p.overflow, ["00:06:3D:AB:CD:EF"])
+            self.assertEqual({r["mac"]: r["tag"] for r in p.radios()}["00:06:3D:AB:CD:EF"], "")
+        finally:
+            p.close()
+        p = await self.poller(port, None, remote_tags=0)
+        try:
+            v = by_rest(await p.poll_once())
+            self.assertFalse(any(k.startswith("Remote1") for k in v))
+            self.assertIn("Remotes.00063D123456.RSSI", v)                          # MAC folders still there
+        finally:
+            p.close()
+            tr.close()
+
+    def test_pin_validation(self):
+        def err(**poll):
+            with self.assertRaises(DriverConfigError) as ctx:
+                build_devices([{"name": "C", "devices": [master_device(161, **poll)]}])
+            return str(ctx.exception)
+        self.assertIn("not a MAC address", err(remote_slots={1: "radio-7"}))
+        self.assertIn("pinned to both", err(remote_slots={1: "10.0.0.1", 2: "10.0.0.1"}))
+        self.assertIn("remote_slots key 51", err(remote_slots={51: "10.0.0.1"}))
+        self.assertIn("remote tag prefix", err(remote_tag_prefix="Re.mote"))
 
 
 class PollConfigTests(unittest.TestCase):

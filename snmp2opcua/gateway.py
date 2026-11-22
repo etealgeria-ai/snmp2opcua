@@ -42,8 +42,8 @@ class Gateway:
         self.engine = TrapTagEngine(cfg.get("_devices") or [])
         if hasattr(self.publisher, "engine"):
             self.publisher.engine = self.engine     # lets client resets (writing 0) reach the engine
-        self.pollers = [DevicePoller(d, self.resolver) for d in cfg.get("_devices") or []
-                        if d.poll is not None and d.poll.enabled]
+        self.pollers = [DevicePoller(d, self.resolver, state_file=cfg.get("polling_state_file"))
+                        for d in cfg.get("_devices") or [] if d.poll is not None and d.poll.enabled]
         if hasattr(self.publisher, "extra_tags"):
             self.publisher.extra_tags = [t for p in self.pollers for t in p.static_tags()]
         self.monitor: Callable[[str, Any], None] | None = None   # set by the desktop UI

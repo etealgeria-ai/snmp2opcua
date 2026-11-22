@@ -9,6 +9,15 @@ Per device (``polling:`` in the config):
       <Channel>.<Device>.Remotes.<MAC>.MAC / IP / RSSI / IfIndex / Online / LastSeen
       <Channel>.<Device>.Remotes.Count / OnlineCount
 
+* fixed RSSI tags Remote1..RemoteN (``remote_tags``, default 50) for SCADA screens:
+
+      <Channel>.<Device>.Remote7          RSSI in dBm of the radio numbered 7
+      <Channel>.<Device>.Remote7_IP / Remote7_MAC / Remote7_Online
+
+  A remote keeps its number: pinned numbers (``remote_slots``: number -> MAC or IP) come
+  first; any other new remote takes the lowest free number, and the numbering is saved in
+  the polling state file so it survives restarts. Unused numbers have Bad quality.
+
 * poll status tags (underscore prefix, like the server's system tags):
 
       <Channel>.<Device>._Polling.OK / Error / LastPoll / DurationMs / Failures
@@ -19,10 +28,12 @@ A remote that drops out of the master's table is marked Online = 0 and keeps its
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import ge_orbit
 from .oids import OidResolver
@@ -79,11 +90,15 @@ def convert(vb: VarBind, data_type: str):
 
 
 class DevicePoller:
-    def __init__(self, dev: DeviceDef, resolver: OidResolver | None = None, client: SnmpClient | None = None):
+    def __init__(self, dev: DeviceDef, resolver: OidResolver | None = None, client: SnmpClient | None = None,
+                 state_file: str | Path | None = None):
         assert dev.poll is not None
         self.dev = dev
         self.cfg = dev.poll
         self.stats = PollStats()
+        self.state_file = Path(state_file) if state_file else None
+        self.slots: dict[int, str] = self._load_slots()      # number -> MAC
+        self.overflow: list[str] = []                         # MACs that didn't get a number
         self.tags: list[TagDef] = [t for t in dev.tags if isinstance(t.address, PollAddress)]
         self.last_values: dict[str, tuple[object, str]] = {}
         self.client = client or SnmpClient(dev.host, self.cfg.community, self.cfg.version, self.cfg.port,
@@ -92,6 +107,89 @@ class DevicePoller:
     def p(self, rest: str) -> str:
         return f"{self.dev.path}.{rest}"
 
+    # ------------------------------------------------------------------ remote numbering
+    def _load_slots(self) -> dict[int, str]:
+        if self.state_file is None or not self.state_file.exists():
+            return {}
+        try:
+            saved = json.loads(self.state_file.read_text()).get(self.dev.path, {})
+            n = self.cfg.remote_tags
+            return {int(k): str(v) for k, v in saved.items() if 1 <= int(k) <= n}
+        except (OSError, ValueError, AttributeError):
+            log.warning("Couldn't read remote numbering from %s; starting fresh", self.state_file)
+            return {}
+
+    def _save_slots(self) -> None:
+        if self.state_file is None:
+            return
+        try:
+            data = json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        data[self.dev.path] = {str(k): v for k, v in sorted(self.slots.items())}
+        try:
+            self.state_file.write_text(json.dumps(data, indent=1))
+        except OSError as exc:
+            log.warning("Couldn't save remote numbering to %s (%s); numbers may change after a restart",
+                        self.state_file, exc)
+
+    def slot_name(self, slot: int) -> str:
+        return f"{self.cfg.remote_tag_prefix}{slot}"
+
+    def slot_of(self, mac: str) -> int | None:
+        return next((n for n, m in self.slots.items() if m == mac), None)
+
+    def _assign_slots(self) -> None:
+        n = self.cfg.remote_tags
+        if n <= 0:
+            return
+        before = dict(self.slots)
+        known = {st.remote.mac: st for st in self.stats.remotes.values()}
+        pins = self.cfg.remote_slots
+        for slot, ident in sorted(pins.items()):         # pinned numbers win
+            mac = ident if ident in known else next((m for m, st in known.items() if st.remote.ip == ident), None)
+            if mac is None:
+                if self.slots.get(slot) not in (None, ident):
+                    self.slots.pop(slot)                 # reserved for the pinned radio
+                continue
+            for other, m in list(self.slots.items()):
+                if m == mac and other != slot:
+                    del self.slots[other]
+            self.slots[slot] = mac
+        self.overflow = []
+        for mac in known:                                # first seen first
+            if self.slot_of(mac) is not None:
+                continue
+            free = next((k for k in range(1, n + 1) if k not in self.slots and k not in pins), None)
+            if free is None:
+                self.overflow.append(mac)
+            else:
+                self.slots[free] = mac
+                log.info("%s: remote %s is %s", self.dev.path, mac, self.slot_name(free))
+        if self.slots != before:
+            self._save_slots()
+
+    def _slot_updates(self, good: bool) -> list[Update]:
+        out: list[Update] = []
+        by_mac = {st.remote.mac: st for st in self.stats.remotes.values()}
+        for slot in range(1, self.cfg.remote_tags + 1):
+            name = self.p(self.slot_name(slot))
+            mac = self.slots.get(slot, "")
+            st = by_mac.get(mac)
+            if st is not None:
+                r = st.remote
+                out += [Update(name, r.rssi if r.rssi is not None else 0, "Long", good=good and r.rssi is not None),
+                        Update(f"{name}_IP", r.ip, "String", good=good),
+                        Update(f"{name}_MAC", r.mac, "String", good=good),
+                        Update(f"{name}_Online", st.online, "Boolean", good=good)]
+            else:      # unused, or reserved for a radio not seen since the restart
+                out += [Update(name, 0, "Long", good=False), Update(f"{name}_IP", "", "String", good=False),
+                        Update(f"{name}_MAC", mac, "String", good=bool(mac) and good),
+                        Update(f"{name}_Online", False, "Boolean", good=bool(mac) and good)]
+        return out
+
     def static_tags(self) -> list[tuple[str, str]]:
         """(path, data type) of tags that exist from the start (OPC UA nodes are created up front)."""
         out = [(self.p("_Polling.OK"), "Boolean"), (self.p("_Polling.Error"), "String"),
@@ -99,6 +197,10 @@ class DevicePoller:
                (self.p("_Polling.Failures"), "DWord")]
         if self.cfg.ge_orbit_remotes:
             out += [(self.p("Remotes.Count"), "DWord"), (self.p("Remotes.OnlineCount"), "DWord")]
+            for slot in range(1, self.cfg.remote_tags + 1):
+                name = self.p(self.slot_name(slot))
+                out += [(name, "Long"), (f"{name}_IP", "String"), (f"{name}_MAC", "String"),
+                        (f"{name}_Online", "Boolean")]
         return out
 
     def _remote_updates(self, key: str, st: RemoteState, good: bool) -> list[Update]:
@@ -168,6 +270,11 @@ class DevicePoller:
         online = sum(st.online for st in self.stats.remotes.values())
         out += [Update(self.p("Remotes.Count"), len(self.stats.remotes), "DWord"),
                 Update(self.p("Remotes.OnlineCount"), online, "DWord")]
+        self._assign_slots()
+        if self.overflow:
+            log.warning("%s: %d remotes have no %s tag (remote_tags is %d): %s", self.dev.path, len(self.overflow),
+                        self.cfg.remote_tag_prefix, self.cfg.remote_tags, ", ".join(self.overflow))
+        out += self._slot_updates(True)
         return out
 
     async def poll_once(self) -> list[Update]:
@@ -199,6 +306,8 @@ class DevicePoller:
                 updates.append(Update(path, value, dt, good=False))
             for key, rs in st.remotes.items():
                 updates += self._remote_updates(key, rs, False)
+            if self.cfg.ge_orbit_remotes:
+                updates += self._slot_updates(False)
         st.last_error = error
         st.duration_ms = int((time.monotonic() - started) * 1000)
         updates += [Update(self.p("_Polling.OK"), ok, "Boolean"),
@@ -211,7 +320,9 @@ class DevicePoller:
     def radios(self) -> list[dict]:
         """Rows for the window's Radios tab."""
         warn = self.cfg.rssi_warning_dbm
+        numbers = {m: self.slot_name(n) for n, m in self.slots.items()}
         return [{"master": self.dev.path, "mac": s.remote.mac, "ip": s.remote.ip, "rssi": s.remote.rssi,
+                 "tag": numbers.get(s.remote.mac, ""),
                  "if_index": s.remote.if_index, "online": s.online,
                  "weak": warn is not None and s.remote.rssi is not None and s.remote.rssi < warn,
                  "last_seen": s.last_seen.astimezone().strftime("%H:%M:%S") if s.last_seen else "",

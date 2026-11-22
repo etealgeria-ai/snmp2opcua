@@ -55,6 +55,7 @@ DEFAULTS: dict = {
         "severity": {"default": 500, "rules": {}},
     },
     "channels": [],                        # SNMP-driver style Channel -> Device -> trap tags
+    "polling_state_file": "snmp2opcua_slots.json",   # remembers which radio is Remote1, Remote2, ...
     "logging": {"level": "INFO"},
 }
 
@@ -199,5 +200,8 @@ def load_config(path: str | Path | None) -> dict:
                                  f"(snmp.v3.users and device {dev.path})")
     cfg["snmp"]["v3"]["_users"] = users
     cfg["_devices"] = devices
+    psf = cfg.get("polling_state_file")
+    if psf and not Path(psf).is_absolute():              # next to the config file
+        cfg["polling_state_file"] = str(base_dir / psf)
     cfg["_endpoints"] = listen_endpoints(cfg)
     return cfg

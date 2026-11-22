@@ -112,8 +112,10 @@ channels:
       #     - {name: OldUpsAlarm, address: "TRAP_V1:.1.3.6.1.4.1.318:G6:S5"}
 
   # GE MDS Orbit: read RSSI and IP of every remote radio from the master station (LN4 in the MCR).
-  # Tags: Radios.Master_LN4.Remotes.<MAC>.RSSI / IP / MAC / IfIndex / Online / LastSeen,
-  #       Radios.Master_LN4.Remotes.Count / OnlineCount, Radios.Master_LN4._Polling.OK / Error / ...
+  # Tags: Radios.Master_LN4.Remote1 ... Remote50  = RSSI (dBm) of each remote, a fixed number per radio,
+  #       with Remote1_IP / Remote1_MAC / Remote1_Online next to each one;
+  #       Radios.Master_LN4.Remotes.<MAC>.RSSI / IP / ... and Remotes.Count / OnlineCount;
+  #       Radios.Master_LN4._Polling.OK / Error / LastPoll / DurationMs / Failures
   - name: Radios
     devices:
       - name: Master_LN4
@@ -129,6 +131,11 @@ channels:
           retries: 1
           ge_orbit_remotes: true
           rssi_warning_dbm: -95       # remotes below this are flagged (window + diagnostics)
+          remote_tags: 50             # Remote1..Remote50; each radio keeps its number
+          remote_tag_prefix: Remote
+          # remote_slots:             # optional: pin numbers to radios (MAC in quotes, or IP)
+          #   1: "00:06:3D:12:34:56"
+          #   2: 10.10.1.22
         tags:                         # extra values to poll (numeric OIDs, SNMP GET)
           - {name: SysName, address: ".1.3.6.1.2.1.1.5.0"}
           - {name: Uptime, address: ".1.3.6.1.2.1.1.3.0", data_type: DWord}
@@ -149,6 +156,9 @@ traps:
       warmStart: 400
       authenticationFailure: 700
       upsTrapOnBattery: 900
+
+# Remembers which radio is Remote1, Remote2, ... (relative to this file)
+polling_state_file: snmp2opcua_slots.json
 
 logging:
   level: INFO

@@ -244,6 +244,9 @@ class PollConfig:
     max_repetitions: int = 20
     ge_orbit_remotes: bool = False    # read RSSI/IP of remote radios from a GE MDS Orbit master
     rssi_warning_dbm: int | None = None
+    remote_tags: int = 50             # fixed tags Remote1..RemoteN (RSSI), 0 = none
+    remote_tag_prefix: str = "Remote"
+    remote_slots: dict[int, str] = field(default_factory=dict)   # pinned: slot -> MAC or IP
 
 
 @dataclass
@@ -446,6 +449,23 @@ def _poll_config(p: dict, dev: DeviceDef, where: str) -> PollConfig:
     if version not in ("1", "2c"):
         raise DriverConfigError(f"{where}: polling supports SNMP version 1 or 2c; set polling.snmp_version")
     warn = p.get("rssi_warning_dbm")
+    remote_tags = _int(p.get("remote_tags"), 0, 1000, f"{where}: remote_tags", 50)
+    prefix = _check_name("remote tag prefix", p.get("remote_tag_prefix", "Remote"))
+    slots: dict[int, str] = {}
+    seen_ids: dict[str, int] = {}
+    for k, v in (p.get("remote_slots") or {}).items():
+        slot = _int(str(k).removeprefix(prefix), 1, max(remote_tags, 1), f"{where}: remote_slots key {k}", 1)
+        if isinstance(v, (int, float)):
+            raise DriverConfigError(f"{where}: remote_slots {k}: put the MAC address in quotes, e.g. "
+                                    f"\"10:20:30:40:50:59\" (YAML reads all-digit MACs as numbers)")
+        ident = normalize_remote_id(str(v))
+        if ident is None:
+            raise DriverConfigError(f"{where}: remote_slots {k}: {v!r} is not a MAC address (00:06:3D:12:34:56) "
+                                    f"or an IP address")
+        if ident in seen_ids:
+            raise DriverConfigError(f"{where}: {v} is pinned to both {prefix}{seen_ids[ident]} and {prefix}{slot}")
+        seen_ids[ident] = slot
+        slots[slot] = ident
     return PollConfig(
         enabled=bool(p.get("enabled", True)),
         community=str(p.get("community", "public")),
@@ -456,7 +476,21 @@ def _poll_config(p: dict, dev: DeviceDef, where: str) -> PollConfig:
         retries=_int(p.get("retries"), 0, 10, f"{where}: polling retries", 1),
         max_repetitions=_int(p.get("max_repetitions"), 1, 200, f"{where}: polling max_repetitions", 20),
         ge_orbit_remotes=bool(p.get("ge_orbit_remotes", False)),
-        rssi_warning_dbm=None if warn is None else _int(warn, -200, 0, f"{where}: rssi_warning_dbm", -95))
+        rssi_warning_dbm=None if warn is None else _int(warn, -200, 0, f"{where}: rssi_warning_dbm", -95),
+        remote_tags=remote_tags, remote_tag_prefix=prefix, remote_slots=slots)
+
+
+def normalize_remote_id(text: str) -> str | None:
+    """A remote radio's MAC ('00:06:3D:12:34:56') or IP address, normalised; None if it's neither."""
+    t = text.strip()
+    try:
+        return str(ipaddress.ip_address(t))
+    except ValueError:
+        pass
+    hexdigits = re.sub(r"[:\-. ]", "", t)
+    if re.fullmatch(r"[0-9A-Fa-f]{12}", hexdigits):
+        return ":".join(hexdigits[i:i + 2] for i in range(0, 12, 2)).upper()
+    return None
 
 
 def _check_events_range(tag: TagDef, dev: DeviceDef) -> None:

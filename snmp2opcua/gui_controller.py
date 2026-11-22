@@ -268,7 +268,9 @@ class GatewayController:
                     "consecutive_failures": p.stats.consecutive_failures, "error": p.stats.last_error,
                     "duration_ms": p.stats.duration_ms, "timeouts": p.client.timeouts,
                     "last_ok": p.stats.last_ok.astimezone().strftime("%H:%M:%S") if p.stats.last_ok else None,
-                    "rssi_warning": p.cfg.rssi_warning_dbm, "radios": p.radios()} for p in gw.pollers],
+                    "rssi_warning": p.cfg.rssi_warning_dbm, "radios": p.radios(),
+                    "remote_tags": p.cfg.remote_tags, "prefix": p.cfg.remote_tag_prefix,
+                    "slots": dict(p.slots), "overflow": list(p.overflow)} for p in gw.pollers],
             }
         try:
             return asyncio.run_coroutine_threadsafe(collect(), loop).result(timeout=3)

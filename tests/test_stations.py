@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 
 from snmp2opcua.config import load_config
-from snmp2opcua.stations import delete_station, list_stations, new_station, parse_form, save_station
+from snmp2opcua.stations import delete_station, list_stations, lock_numbers, new_station, parse_form, save_station
 
 TEXT = """# radio network
 snmp:
@@ -52,6 +52,30 @@ def loads(text):
         p = Path(d) / "c.yaml"
         p.write_text(text)
         return load_config(p)
+
+
+class RemoteTagFormTests(unittest.TestCase):
+    def test_count_prefix_and_lock(self):
+        orig = list_stations(TEXT)[0]
+        self.assertEqual((orig.remote_tags, orig.remote_tag_prefix), (50, "Remote"))
+        st, probs = parse_form(form(remote_tags="50", remote_tag_prefix="Remote"), orig, TEXT)
+        self.assertEqual(save_station(TEXT, st, orig), TEXT)                 # defaults aren't written
+        st, _ = parse_form(form(remote_tags="64", remote_tag_prefix="Radio"), orig, TEXT)
+        out = save_station(TEXT, st, orig)
+        p = yaml.safe_load(out)["channels"][0]["devices"][0]["polling"]
+        self.assertEqual((p["remote_tags"], p["remote_tag_prefix"]), (64, "Radio"))
+        _, probs = parse_form(form(remote_tags="2000", remote_tag_prefix="Re.mote"), orig, TEXT)
+        self.assertEqual({f for f, _ in probs}, {"remote_tags", "remote_tag_prefix"})
+
+        locked = lock_numbers(TEXT, orig, {2: "00:06:3D:12:34:57", 1: "10:20:30:40:50:59"})
+        pins = yaml.safe_load(locked)["channels"][0]["devices"][0]["polling"]["remote_slots"]
+        self.assertEqual(pins, {1: "10:20:30:40:50:59", 2: "00:06:3D:12:34:57"})      # stays a string
+        dev = next(d for d in loads(locked)["_devices"] if d.name == "Master_LN4")
+        self.assertEqual(dev.poll.remote_slots, {1: "10:20:30:40:50:59", 2: "00:06:3D:12:34:57"})
+        self.assertIn("# LN4 in the MCR rack", locked)
+        with self.assertRaisesRegex(ValueError, "put the MAC address in quotes"):
+            loads(TEXT.replace("          rssi_warning_dbm: -95",
+                               "          rssi_warning_dbm: -95\n          remote_slots: {1: 10:20:30:40:50:59}"))
 
 
 class StationTests(unittest.TestCase):

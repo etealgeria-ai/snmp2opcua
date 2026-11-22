@@ -517,7 +517,7 @@ class GatewayApp:
         self.radio_tree = self._make_tree(box, [
             ("master", "Master station", 170, False), ("mac", "Remote MAC", 150, False),
             ("ip", "Remote IP", 130, False), ("rssi", "RSSI (dBm)", 90, False), ("ifindex", "IfIndex", 70, False),
-            ("status", "Status", 180, True), ("seen", "Last seen", 90, False)])
+            ("status", "Status", 180, True), ("seen", "Last seen", 90, False), ("tag", "OPC UA tag", 100, False)])
         self.radio_tree.tag_configure("offline", background=ALARM_TINT)
         self.radio_tree.tag_configure("weak", background=WARN_TINT)
         self.empty_radios = tk.Label(box, background=FIELD, foreground=MUTED, font=self.f_base, justify="center",
@@ -543,7 +543,8 @@ class GatewayApp:
             else:
                 status, tag = "Online", ()
             tree.insert("", "end", values=(r["master"], r["mac"], r["ip"], "N/A" if r["rssi"] is None else r["rssi"],
-                                           r["if_index"], status, r["last_seen"]), tags=tag)
+                                           r["if_index"], status, r["last_seen"], r.get("tag") or "none"),
+                        tags=tag)
         if rows:
             self.empty_radios.place_forget()
         parts = []
@@ -634,7 +635,7 @@ class GatewayApp:
 
     # ------------------------------------------------------------------ stations tab
     STATION_FIELDS = ["channel", "name", "ip", "community", "version", "port", "scan_rate_s", "timeout_ms",
-                      "retries", "max_repetitions", "rssi_warning_dbm"]
+                      "retries", "max_repetitions", "rssi_warning_dbm", "remote_tags", "remote_tag_prefix"]
     STATION_FLAGS = ["rssi_enabled", "receive_traps", "auto_create_tags"]
 
     def _build_stations_tab(self) -> ttk.Frame:
@@ -714,6 +715,16 @@ class GatewayApp:
         ttk.Label(sg, text="dBm", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(6, 0))
         self.station_entries["rssi_warning_dbm"] = rssi
 
+        rt = section("Remote tags")
+        row(rt, 0, "Number of RSSI tags", "remote_tags", width=8,
+            hint="Remote1 … RemoteN, each with _IP, _MAC and _Online; 0 = none")
+        row(rt, 1, "Name prefix", "remote_tag_prefix", width=12)
+        self.btn_lock_numbers = ttk.Button(rt, text="Lock current numbers", command=self.lock_numbers)
+        self.btn_lock_numbers.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(rt, text="Each radio keeps its number automatically; locking writes the numbering into the "
+                           "configuration so it can't change.", style="Small.TLabel", wraplength=420,
+                  justify="left").grid(row=2, column=1, columnspan=2, sticky="w", padx=(10, 0), pady=(6, 0))
+
         tr = section("Traps")
         ttk.Checkbutton(tr, text="Also receive traps from this station", variable=self.sb["receive_traps"]
                         ).grid(row=0, column=0, sticky="w", pady=2)
@@ -740,6 +751,7 @@ class GatewayApp:
         self.station_entries["rssi_warning_dbm"].configure(state="normal" if self.sb["rssi_enabled"].get()
                                                            else "disabled")
         self.btn_remove_station.configure(state="normal" if self.station_current is not None else "disabled")
+        self.btn_lock_numbers.configure(state="normal" if self.station_current is not None else "disabled")
 
     def _refresh_stations(self, keep: str | None = None) -> None:
         try:
@@ -773,7 +785,8 @@ class GatewayApp:
                       "timeout_ms": str(src.timeout_ms), "retries": str(src.retries),
                       "max_repetitions": str(src.max_repetitions),
                       "rssi_warning_dbm": str(src.rssi_warning_dbm if src.rssi_warning_dbm is not None
-                                              else stations_mod.DEFAULT_RSSI_WARNING)}
+                                              else stations_mod.DEFAULT_RSSI_WARNING),
+                      "remote_tags": str(src.remote_tags), "remote_tag_prefix": src.remote_tag_prefix}
             for k, v in values.items():
                 self.sv[k].set(v)
             self.sb["rssi_enabled"].set(src.rssi_warning_dbm is not None)
@@ -861,6 +874,33 @@ class GatewayApp:
         else:
             self._station_message(f"Saved {stn.path} to {self.ctl.config_path.name} (previous version kept as .bak)."
                                   + (" Restart the gateway to apply it." if self.ctl.running else ""))
+
+    def lock_numbers(self) -> None:
+        stn = self.station_current
+        if stn is None or self._editor_blocks():
+            return
+        if self.station_dirty:
+            self._station_message("Save or revert your changes first, then lock the numbers.", error=True)
+            return
+        live = next((p for p in self.ctl.snapshot().get("polling") or [] if p["path"] == stn.path), None)
+        if live is None:
+            self._station_message("Start the gateway and let it poll this station once, then lock the numbers.",
+                                  error=True)
+            return
+        if not live["slots"]:
+            self._station_message("No remotes have numbers yet.", error=True)
+            return
+        try:
+            self.ctl.save_text(stations_mod.lock_numbers(self.ctl.read_text(), stn, live["slots"]))
+        except (ValueError, OSError) as exc:
+            self._station_message(f"Not locked: {exc}", error=True)
+            return
+        self._load_config_into_ui()
+        self._refresh_stations(keep=stn.path)
+        pairs = ", ".join(f"{live['prefix']}{n} = {m}" for n, m in sorted(live["slots"].items())[:4])
+        more = " …" if len(live["slots"]) > 4 else ""
+        self._station_message(f"Locked {len(live['slots'])} numbers for {stn.path} ({pairs}{more}) under "
+                              f"polling.remote_slots.")
 
     def remove_station(self) -> None:
         stn = self.station_current

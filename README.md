@@ -129,9 +129,11 @@ On Windows you can also double-click `run_gui.pyw`, which uses the `config.yaml`
 - **Sources:** every address that has sent traps, with a count and its last trap.
 - **Radios:** the remote radios of each GE MDS Orbit master: MAC, IP, RSSI, IfIndex, status and last seen, weakest signal first.
   - Remotes below `rssi_warning_dbm` are tinted amber and labelled "weak signal". Offline remotes are tinted red and labelled.
+  - An OPC UA tag column shows which `RemoteN` tag each radio has.
   - *Copy as report* gives the same table as the original pysnmp script.
 - **Stations:** a form for GE MDS Orbit master stations, so you can change the settings without editing YAML.
-  - Fields: channel, name, **IP address**, read community (masked, with *Show*), SNMP version, port, scan rate, timeout, retries, max repetitions, the RSSI warning level, and whether to receive traps and create the standard trap tags.
+  - Fields: channel, name, **IP address**, read community (masked, with *Show*), SNMP version, port, scan rate, timeout, retries, max repetitions, the RSSI warning level, the number and name of the Remote1…RemoteN tags, and whether to receive traps and create the standard trap tags.
+  - *Lock current numbers* pins today's Remote numbering in the config.
   - *Add station* and *Remove* manage the list. *Test connection* polls the master with the values on screen and reports how many remotes answered and their RSSI range.
   - *Save* rewrites only the values you changed in `config.yaml`, keeping your comments and layout. It validates first, with the same messages as the manuals (e.g. "Invalid IP address…", "The rate must be within the range of 10 milliseconds and 49 days."), and keeps the previous file as `.bak`. *Save and restart* applies the change straight away.
 - **Rejected:** every refused or unreadable packet with the exact reason, e.g. a wrong community, an unknown v3 user, a failed authentication or decryption, or a stale trap.
@@ -233,18 +235,27 @@ channels:
 
 | Tag | Type | Meaning |
 |---|---|---|
-| `Radios.Master_LN4.Remotes.<MAC>.RSSI` | Int32 | RSSI in dBm, e.g. `ns=2;s=Radios.Master_LN4.Remotes.00063D123456.RSSI` |
+| `Radios.Master_LN4.Remote1` … `Remote50` | Int32 | RSSI in dBm of the radio with that number, e.g. `ns=2;s=Radios.Master_LN4.Remote7` |
+| `….Remote7_IP` / `_MAC` / `_Online` | String / String / Boolean | Which radio Remote7 is, and whether it's connected |
+| `Radios.Master_LN4.Remotes.<MAC>.RSSI` | Int32 | The same RSSI, by MAC, e.g. `ns=2;s=Radios.Master_LN4.Remotes.00063D123456.RSSI` |
 | `….Remotes.<MAC>.IP` / `.MAC` / `.IfIndex` | String / String / Int32 | The remote's address and row index |
 | `….Remotes.<MAC>.Online` / `.LastSeen` | Boolean / DateTime | Whether it was in the last poll, and when it was last seen |
 | `….Remotes.Count` / `.OnlineCount` | UInt32 | Remotes ever seen / in the last poll |
 | `…._Polling.OK` / `.Error` / `.LastPoll` / `.DurationMs` / `.Failures` | | Poll status |
+
+**Remote numbering (Remote1 … Remote50):** SCADA screens can bind to fixed tags, so every radio keeps its number.
+- A newly seen remote takes the lowest free number. The numbering is saved in `polling_state_file` (next to the config), so it survives restarts.
+- A remote that goes offline keeps its number. So does one that hasn't been seen since a restart.
+- To fix numbers for good, pin them under `polling.remote_slots` (number → MAC or IP), or press **Lock current numbers** on the Stations page. Pins take precedence, and their numbers stay reserved until that radio appears.
+- Unused numbers have Bad quality. Change the count with `remote_tags` (0 turns them off) and the name with `remote_tag_prefix`.
+- If there are more remotes than numbers, the Radios view and Diagnostics say which radios have no tag.
 
 How the tags behave:
 - A remote's folder is created the first time the master reports it.
 - A remote that drops out of the table keeps its last RSSI and gets `Online = 0`.
 - If the master stops answering, every polled tag keeps its last value with Bad quality and `_Polling.OK = 0`. The Radios view and Diagnostics then show the error with likely causes (community, the master's SNMP access list, UDP 161).
 
-You can change all of this in the window's **Stations** page instead of editing YAML. The settings are `community`, `port`, `snmp_version` (1 or 2c), `scan_rate_ms` (10 ms to 49 days), `timeout_ms`, `retries`, `max_repetitions` (the gateway halves it automatically if the master answers `tooBig`), `ge_orbit_remotes` and `rssi_warning_dbm`. Polled values are published in OPC UA server mode. In client mode they appear in the window and Diagnostics only.
+You can change all of this in the window's **Stations** page instead of editing YAML. The settings are `community`, `port`, `snmp_version` (1 or 2c), `scan_rate_ms` (10 ms to 49 days), `timeout_ms`, `retries`, `max_repetitions` (the gateway halves it automatically if the master answers `tooBig`), `ge_orbit_remotes`, `rssi_warning_dbm`, `remote_tags`, `remote_tag_prefix` and `remote_slots`. Polled values are published in OPC UA server mode. In client mode they appear in the window and Diagnostics only.
 
 **The same report on the command line:**
 
@@ -307,7 +318,7 @@ snmp:
 python -m unittest discover -s tests -v
 ```
 
-The 89 tests cover:
+The 93 tests cover:
 
 - decoding a hand-encoded v1 packet and every SNMP value type
 - INFORM acknowledgements, community filtering and garbled packets
@@ -329,6 +340,7 @@ The 89 tests cover:
   - GET, GETNEXT and GETBULK walks, with `tooBig` back-off, timeouts and retries
   - the remote-table index and IP parsing, and a report identical to the original script's
   - remotes going offline, the master going down, value conversion and config checks
+  - stable Remote1…RemoteN numbering: persistence across restarts, pins by MAC or IP, overflow, unused numbers
   - an end-to-end gateway run
 - the Stations page logic:
   - validation messages

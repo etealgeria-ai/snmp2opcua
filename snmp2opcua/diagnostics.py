@@ -356,6 +356,14 @@ def run_diagnostics(ctl, tk_version: str | None = None) -> list[Check]:
                     ("Offline: " + ", ".join(f"{r['mac']} ({r['ip']}, last seen {r['last_seen']})" for r in offline))
                     if offline else ("Check that the remotes are powered and associated with this master."
                                      if not radios else ""))
+                if lp["remote_tags"]:
+                    used = sorted(lp["slots"])
+                    span = f" ({lp['prefix']}{used[0]}…{lp['prefix']}{used[-1]})" if used else ""
+                    add(sec, f"RSSI tags of {dev.path}", "warn" if lp["overflow"] else "ok",
+                        f"{len(used)} of {lp['remote_tags']} {lp['prefix']}N tags in use{span}"
+                        + (f"; {len(lp['overflow'])} remotes have no tag" if lp["overflow"] else ""),
+                        (f"No {lp['prefix']}N tag for: {', '.join(lp['overflow'])}. Raise remote_tags in the "
+                         "Stations page.") if lp["overflow"] else "")
                 weak = sorted((r for r in radios if r["online"] and r["weak"]), key=lambda r: r["rssi"])
                 if weak:
                     add(sec, f"Weak signal on {dev.path}", "warn",
