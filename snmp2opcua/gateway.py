@@ -7,9 +7,11 @@ import logging
 import signal
 from typing import Any, Callable
 
+from .config import listen_endpoints
 from .oids import OidResolver
-from .receiver import Stats, TrapProtocol, start_listener
+from .receiver import ListenerError, Stats, TrapProtocol, start_listener
 from .severity import SeverityMap
+from .snmp_driver import TrapTagEngine
 from .snmpv3 import SnmpV3Engine, load_engine_state
 
 log = logging.getLogger("snmp2opcua")
@@ -22,7 +24,7 @@ def make_publisher(cfg: dict):
             from .opcua_client import OpcUaClientPublisher
             return OpcUaClientPublisher(cfg["opcua"]["client"], severity)
         from .opcua_server import OpcUaServerPublisher
-        return OpcUaServerPublisher(cfg["opcua"]["server"], severity)
+        return OpcUaServerPublisher(cfg["opcua"]["server"], severity, devices=cfg.get("_devices") or [])
     except ImportError as exc:
         raise SystemExit(f"Missing dependency ({exc}). Run: pip install -r requirements.txt") from exc
 
@@ -34,8 +36,11 @@ class Gateway:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=int(cfg["traps"]["queue_size"]))
         self.publisher = publisher if publisher is not None else make_publisher(cfg)
         self.resolver = OidResolver(cfg["traps"].get("oid_names"))
-        self.transport: asyncio.DatagramTransport | None = None
+        self.transports: list = []
         self.v3: SnmpV3Engine | None = None
+        self.engine = TrapTagEngine(cfg.get("_devices") or [])
+        if hasattr(self.publisher, "engine"):
+            self.publisher.engine = self.engine     # lets client resets (writing 0) reach the engine
         self.monitor: Callable[[str, Any], None] | None = None   # set by the desktop UI
         self._stop = asyncio.Event()
 
@@ -46,6 +51,10 @@ class Gateway:
         while True:
             trap = await self.queue.get()
             try:
+                trap.tag_updates = self.engine.process(trap)
+                if trap.tag_updates:
+                    self._notify("tags", [(u.path, self.engine.values[u.path][0], u.good)
+                                          for u in trap.tag_updates if u.path in self.engine.values])
                 await self.publisher.publish(trap)
                 self.stats.published += 1
             except asyncio.CancelledError:
@@ -56,6 +65,15 @@ class Gateway:
             finally:
                 self.queue.task_done()
             await self._status()
+
+    def _notify(self, kind: str, payload) -> None:
+        """Tell the desktop UI; a failing UI callback must never cost a trap."""
+        if self.monitor is None:
+            return
+        try:
+            self.monitor(kind, payload)
+        except Exception:
+            log.debug("monitor callback failed", exc_info=True)
 
     async def _status(self) -> None:
         try:
@@ -84,33 +102,37 @@ class Gateway:
                      ", ".join(f"{u.name} ({u.level})" for u in users))
         await self.publisher.start()
         tasks = []
+        endpoints = listen_endpoints(self.cfg)       # computed now, so later overrides (--port, tests) apply
         try:
-            self.transport = await start_listener(
-                loop, snmp["listen_host"], int(snmp["listen_port"]),
-                lambda: TrapProtocol(self.queue, self.stats, self.resolver, snmp["communities"],
-                                     snmp["allowed_sources"], snmp["respond_to_informs"],
-                                     v3=self.v3, versions=snmp["versions"], monitor=self.monitor),
-            )
+            core = TrapProtocol(self.queue, self.stats, self.resolver, snmp["communities"],
+                                snmp["allowed_sources"], snmp["respond_to_informs"],
+                                v3=self.v3, versions=snmp["versions"], monitor=self.monitor,
+                                accept_all_hosts=snmp.get("accept_all_hosts"))
+            for host, port, proto in endpoints:
+                factory = (lambda c=core: c) if proto == "TCP" else (lambda: TrapProtocol(
+                    self.queue, self.stats, self.resolver, snmp["communities"], snmp["allowed_sources"],
+                    snmp["respond_to_informs"], v3=self.v3, versions=snmp["versions"], monitor=self.monitor,
+                    accept_all_hosts=snmp.get("accept_all_hosts")))
+                self.transports.append(await start_listener(loop, host, port, factory, proto))
+            for st in self.engine.state.values():
+                if st.error:
+                    log.warning(st.error)
             tasks = [asyncio.create_task(self._consume()), asyncio.create_task(self._status_loop())]
             if self.monitor is not None:
-                self.monitor("started", {
-                    "listen": f"{snmp['listen_host']}:{snmp['listen_port']}",
+                self._notify("started", {
+                    "listen": [f"{proto} {host}:{port}" for host, port, proto in endpoints],
                     "versions": list(snmp["versions"]),
                     "engine_id": self.v3.engine_id.hex() if self.v3 else None,
+                    "devices": len(self.engine.devices),
                 })
             await self._stop.wait()
             log.info("Shutting down")
-        except PermissionError:
-            log.error("No permission to bind UDP port %s. Run as root/admin, grant CAP_NET_BIND_SERVICE, "
-                      "or use a port above 1024 (see README).", snmp["listen_port"])
-            raise
-        except OSError as exc:
-            log.error("Cannot bind UDP port %s: %s. Is another trap receiver (snmptrapd, the Windows "
-                      "'SNMP Trap' service) already using it?", snmp["listen_port"], exc)
+        except ListenerError as exc:
+            log.error("%s", exc.strerror)
             raise
         finally:
-            if self.transport is not None:
-                self.transport.close()
+            for t in self.transports:
+                t.close()
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)

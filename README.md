@@ -8,7 +8,7 @@ Receives SNMP traps from switches, UPSs, PLCs, firewalls and similar devices, an
 
 It has two modes:
 
-- **server** (default): the gateway runs its own OPC UA server. Each trap updates variables and fires an OPC UA event.
+- **server** (default): the gateway runs its own OPC UA server. Each trap updates variables and fires an OPC UA event. Configured devices also get **trap tags in the style of the KEPServerEX SNMP driver**, such as `ns=2;s=Channel1.Switch1.linkDown`.
 - **client**: the gateway connects to an OPC UA server you already have and writes trap fields into NodeIds you choose.
 
 ## Features
@@ -16,7 +16,12 @@ It has two modes:
 - SNMP **v1 traps**, **v2c traps and informs**, and **v3 traps and informs** (informs are acknowledged)
 - **SNMPv3 USM**: authentication with MD5, SHA-1 or SHA-224/256/384/512, and encryption with DES, AES-128 or AES-192/256 (both the net-snmp and Cisco key formats). Informs work with engine discovery, and traps get replay protection
 - The SNMP decoder is built in and needs no SNMP library. v1 traps are converted to v2 notification OIDs (RFC 3584), so traps from every version look the same downstream
-- Community allow-list (v1/v2c), USM users (v3), a source IP/CIDR allow-list, and a setting to accept only some SNMP versions (e.g. v3 only)
+- **Trap tags like KEPServerEX's SNMP driver:**
+  - a Channel → Device → Tag tree, with `TRAP_V1:` / `TRAP_V2C:` addresses, the `:Px` port filter and `[n]` table fields
+  - a per-device trap events queue (`EVENTS_COUNT`, `EVENTS_001…`) and auto-created coldStart/warmStart/linkUp/linkDown tags
+  - KEPServerEX tag CSV import/export
+- **Traps from Kepware SNMP Agents**: their `lastTrapDescr` becomes the trap's description, and the agent's system objects get readable names
+- Community allow-list (v1/v2c), USM users (v3), an "accept packets from all hosts" option with a host list, a setting to accept only some SNMP versions (e.g. v3 only), several network interfaces/ports, and UDP or TCP trap listeners
 - Friendly OID names: common MIBs are built in (IF-MIB, SNMPv2-MIB, UPS-MIB, ...), and you can add your own in the config
 - OPC UA event severity is mapped per trap name or OID prefix
 - Each source device gets its own node with a trap count and its last trap
@@ -116,7 +121,11 @@ On Windows you can also double-click `run_gui.pyw`, which uses the `config.yaml`
   - High-severity rows (800 or more) are tinted red and medium ones (600–799) amber. The severity number and label are always shown as text as well.
   - You can filter by any text (source, trap name, numeric OID, v3 user, values), pause the feed, and export to CSV.
   - Select a trap to see its full JSON.
-- **Devices:** every source that has sent traps, with a count and its last trap.
+- **Tags:** the Channel → Device → Tag tree with live values and Good/Bad quality, like a quick client.
+  - By default it shows trap tags, your own tags, `EVENTS_COUNT` and `EVENTS_001`. Tick the box to see every table field and the whole events queue.
+  - *Export tags CSV…* writes the selected device's tags in KEPServerEX's CSV layout.
+  - *Import tags CSV…* validates a CSV and saves it as the device's `tags_csv` file.
+- **Sources:** every address that has sent traps, with a count and its last trap.
 - **Rejected:** every refused or unreadable packet with the exact reason, e.g. a wrong community, an unknown v3 user, a failed authentication or decryption, or a stale trap.
 - **Diagnostics:** health checks that run when you open the tab or press *Run checks*. Each result is marked Problem, Warning, OK or Info, with a "How to fix" note where needed. *Copy report* and *Save report…* produce a plain-text report for a ticket or email, and it never contains keys or passwords. The checks cover:
   - **Configuration:** whether it loads, the SNMP versions accepted, and the v3 users
@@ -128,6 +137,70 @@ On Windows you can also double-click `run_gui.pyw`, which uses the `config.yaml`
 - **Send test trap:** sends v1, v2c or v3 traps and informs to the gateway or any other host. You can pick a configured v3 user or enter custom credentials, which is handy for testing a device's settings.
 - **Configuration:** edit `config.yaml`, then use *Check*, *Save* or *Save and restart*. An invalid file is never saved, and the previous version is kept as `config.yaml.bak`.
 - **Log:** the gateway's own log messages.
+
+## Devices and trap tags (KEPServerEX SNMP driver style)
+
+The gateway can present traps the way KEPServerEX's SNMP driver does. You configure channels and devices, and each device gets trap tags that SCADA clients read or subscribe to. NodeIds follow Kepware's pattern, `ns=2;s=<Channel>.<Device>.<Tag>`, so screens built against KEPServerEX can usually be pointed at the gateway unchanged.
+
+```yaml
+channels:
+  - name: Channel1
+    devices:
+      - name: Switch1
+        ip: 192.168.1.20            # traps are matched to the device by source address
+        snmp_version: 2c            # 1, 2c or 3 (with a v3: block, one user per device)
+        trap: {port: 162, protocol: UDP, community: "", number_of_events: 10, number_of_fields: 10}
+        tags:
+          - {name: Port3Down, address: "TRAP_V2C:.1.3.6.1.6.3.1.1.5.3:P3"}
+          - {name: Port3Down_Name, address: "TRAP_V2C:.1.3.6.1.6.3.1.1.5.3:P3[10]"}
+        tags_csv: Switch1_tags.csv  # optional, KEPServerEX tag CSV
+```
+
+**Device settings** match the driver's Trap/Inform properties:
+- Enable SNMP Trap/Inform Support
+- Port (default: the gateway's `listen_port`) and UDP or TCP
+- Custom Community (empty accepts any community, or none)
+- Number of Events (1–100, default 10) and Number of Fields (1–20, default 10)
+- Extended ASCII
+
+A device only takes traps of its own SNMP version. A v3 device only takes traps from its own user, and its user is added to the gateway's SNMPv3 users automatically.
+
+**Tag addresses:**
+
+| Address | Updates on |
+|---|---|
+| `TRAP_V1:.1.3.6.1.2.1.11:Gx` | SNMPv1 generic trap x: 0 coldStart, 1 warmStart, 2 linkDown, 3 linkUp, 4 authenticationFailure, 5 egpNeighborLoss |
+| `TRAP_V1:<enterprise>:G6:Sx` | SNMPv1 enterprise-specific trap x |
+| `TRAP_V2C:<trap OID>` | SNMPv2c/v3 trap or inform with that snmpTrapOID |
+| `…:Px` | only when the trap's ifIndex varbind is x (the base tag updates too) |
+| `…[n]` | table field n: `[1]` arrival time, `[2]` enterprise, `[3]` generic, `[4]` specific, `[5]` sysUpTime, `[6]` varbind count, `[7]`/`[8]` first varbind OID/value, `[9]…` the rest |
+
+How the tags behave:
+- A base tag is a Boolean that becomes **1** when its trap arrives. A client writes **0** to reset it.
+- Table fields are read-only. If `[n]` points past the end of a message, the tag is shown with Bad quality.
+- For SNMPv2c traps, fields 2–4 are derived per RFC 3584.
+
+**Created automatically for every device:**
+- `coldStart`, `warmStart`, `linkUp` and `linkDown`, each with `_001`…`_020` table fields. Set `auto_create_tags: false` to skip them.
+- The trap events queue:
+  - `EVENTS_COUNT`: counts traps; write 0 to reset it.
+  - `EVENTS_001`…: newest first; each holds the whole message as a semicolon-separated string.
+  - `EVENTS_nnn_FLDCNT` and `EVENTS_nnn_001`…: the field count and the individual fields.
+
+The driver documentation doesn't spell out the field layout of queue messages, so they use the same order as the table fields.
+
+**Tag CSV:** the layout matches KEPServerEX's tag export: Tag Name, Address, Data Type, Client Access, Description and so on. Rows whose address isn't a trap or `EVENTS_` address (polled OIDs, for example) are skipped and reported. Dotted names such as `Traps.Port3Down` become tag groups (folders in OPC UA).
+
+```bash
+python -m snmp2opcua.tag_csv check examples/kepware_tags.csv
+python -m snmp2opcua.tag_csv export -c config.yaml --device Channel1.Switch1 -o Switch1_tags.csv
+```
+
+Traps from addresses that aren't configured devices are still published under `Gateway/LastTrap`, as events and in the window. Diagnostics lists them so you can add devices for them.
+
+## Traps from Kepware SNMP Agents
+
+KEPServerEX's SNMP Agent Plug-In puts a trap's description into its `lastTrapDescr` system object (`1.3.6.1.4.1.30144.12.<agent>.1.7.0`) and sends it with the trap. The gateway turns that into the trap's **description**. It appears in the JSON, the event message, the window's Description column and the log. The agent's other system objects (sysDescr…sysLocation under `1.3.6.1.4.1.30144.12.<agent>.1.<n>.0`) get readable names, and the agent's sub-identifier is recorded. To get tags for a Kepware trap, copy the V2c OID (or the V1 Enterprise OID and Specific Trap Type) from the trap's properties in KEPServerEX into a `TRAP_V2C:` or `TRAP_V1:…:G6:Sx` address.
 
 ## SNMPv3
 
@@ -158,6 +231,7 @@ snmp:
 
 - **Port 162**: run as root or Administrator, or on Linux use the included `snmp2opcua.service`, which grants `CAP_NET_BIND_SERVICE`. You can also listen on 1162 and redirect: `iptables -t nat -A PREROUTING -p udp --dport 162 -j REDIRECT --to-ports 1162`.
 - **Windows**: stop or disable the built-in **SNMP Trap** service, which holds UDP 162. Open UDP 162 and TCP 4840 in the firewall.
+- **If a listener can't start**, the gateway reports it the way the driver does: "Unable to bind trap socket on binding address …, port … and protocol …". Diagnostics checks every configured listener (network interfaces and device trap ports, UDP and TCP) before you start.
 - **OPC UA security**: `NoSecurity` is for lab use. For production, set `security_policies: [Basic256Sha256_SignAndEncrypt]` and provide a certificate and key, for example:
   `openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout certs/server_key.pem -outform der -out certs/server_cert.der -subj "/CN=snmp2opcua" -addext "subjectAltName=URI:urn:snmp2opcua:gateway,DNS:$(hostname)"`
 - **Community strings and v3 keys** are never published to OPC UA.
@@ -176,7 +250,7 @@ snmp:
 python -m unittest discover -s tests -v
 ```
 
-The 41 tests cover:
+The 64 tests cover:
 
 - decoding a hand-encoded v1 packet and every SNMP value type
 - INFORM acknowledgements, community filtering and garbled packets
@@ -186,6 +260,14 @@ The 41 tests cover:
 - live UDP end-to-end runs with a fake publisher
 - the desktop window's controller: start, stop and restart, live trap and rejection events, test traps, config checks with backup, and the port-in-use error
 - diagnostics: ports in use, a bad or missing config, an unreachable OPC UA server, a disconnected client session, SNMPv3 failure counters on a running gateway, and that the report contains no secrets
+- trap tags:
+  - every address form from the driver documentation, plus clear rejections of bad ones
+  - device validation messages and auto-created tags
+  - port filters, table fields and RFC 3584 identities
+  - device version, community and v3-user filtering
+  - the events queue and resets, and Extended ASCII
+- Kepware agent traps, KEPServerEX tag CSV import/export, the new config checks, and listener error wording
+- end-to-end: devices on UDP and on TCP, including a v3 trap split across TCP packets
 
 They don't need asyncua.
 
@@ -195,9 +277,12 @@ They don't need asyncua.
 snmp2opcua/
   ber.py           BER encode/decode (SNMP subset)
   trap.py          SNMP v1/v2c message → Trap, INFORM ack builder
+  snmp_driver.py   KEPServerEX-style devices and trap tags: addresses, events queue, table fields
+  tag_csv.py       KEPServerEX tag CSV import/export
+  kepware.py       traps from Kepware SNMP Agents (lastTrapDescr, system objects)
   snmpv3.py        SNMPv3 messages: auth, timeliness, decrypt, discovery Reports, inform Responses
   usm.py           USM crypto: key localization, HMAC, DES/AES
-  receiver.py      asyncio UDP listener, filtering, stats
+  receiver.py      UDP and TCP trap listeners, filtering, stats
   oids.py          built-in OID names + resolver
   severity.py      trap → OPC UA severity rules
   opcua_server.py  server mode (asyncua Server)
@@ -210,4 +295,5 @@ snmp2opcua/
 config.yaml        example configuration
 examples/watch_traps.py   OPC UA subscriber for testing
 run_gui.pyw        double-click launcher for the desktop window
+examples/kepware_tags.csv  example tag CSV in KEPServerEX's layout
 ```

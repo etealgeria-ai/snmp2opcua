@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from . import ber
@@ -26,6 +26,10 @@ class VarBind:
     name: str
     type: str
     value: object
+    raw: bytes = field(default=b"", repr=False, compare=False)   # undecoded value, for data-type conversion
+
+    def as_dict(self) -> dict:
+        return {"oid": self.oid, "name": self.name, "type": self.type, "value": self.value}
 
 
 @dataclass
@@ -50,17 +54,24 @@ class Trap:
     security_level: str | None = None     # noAuthNoPriv / authNoPriv / authPriv
     engine_id: str | None = None          # msgAuthoritativeEngineID (hex)
     context_name: str | None = None
+    # enrichment
+    description: str | None = None        # e.g. Kepware's lastTrapDescr, or the mapping's description
+    vendor: str | None = None             # e.g. "Kepware SNMP Agent"
+    agent_id: int | None = None           # Kepware agent MIB sub-identifier
+    mapped: str | None = None             # "Group.Trap" when a trap mapping matched
     # internal: request-id of an INFORM, needed for the acknowledgement
     request_id: int | None = field(default=None, repr=False)
+    tag_updates: list = field(default_factory=list, repr=False, compare=False)   # snmp_driver.Update
 
     def to_dict(self, include_community: bool = False) -> dict:
-        d = asdict(self)
-        d.pop("request_id")
+        d = {k: v for k, v in self.__dict__.items() if k not in ("request_id", "tag_updates", "varbinds")}
+        d["varbinds"] = [v.as_dict() for v in self.varbinds]
         if not include_community:
             d.pop("community")
         d["received_at"] = self.received_at.isoformat()
         for k in ("enterprise", "agent_address", "generic_trap", "specific_trap",
-                  "security_name", "security_level", "engine_id", "context_name"):
+                  "security_name", "security_level", "engine_id", "context_name",
+                  "description", "vendor", "agent_id", "mapped"):
             if d[k] is None:
                 d.pop(k)
         return d
@@ -69,13 +80,15 @@ class Trap:
         return json.dumps(self.to_dict(**kw), default=str, ensure_ascii=False)
 
     def varbinds_json(self) -> str:
-        return json.dumps([asdict(v) for v in self.varbinds], default=str, ensure_ascii=False)
+        return json.dumps([v.as_dict() for v in self.varbinds], default=str, ensure_ascii=False)
 
     def summary(self) -> str:
         extras = ", ".join(f"{v.name}={v.value}" for v in self.varbinds[:4])
         more = " ..." if len(self.varbinds) > 4 else ""
         who = f" (user {self.security_name})" if self.security_name else ""
-        return f"{self.version} {self.pdu} from {self.source_ip}{who}: {self.trap_name} [{extras}{more}]"
+        name = self.mapped or self.trap_name
+        desc = f" \"{self.description}\"" if self.description else ""
+        return f"{self.version} {self.pdu} from {self.source_ip}{who}: {name}{desc} [{extras}{more}]"
 
 
 def _read_varbinds(data: bytes, start: int, end: int, resolver: OidResolver) -> list[VarBind]:
@@ -87,7 +100,7 @@ def _read_varbinds(data: bytes, start: int, end: int, resolver: OidResolver) -> 
         oid = ber.decode_oid(data[o_start:o_end])
         tag, v_start, v_end = ber.read_tlv(data, o_end, vb_end)
         type_name, value = ber.decode_value(tag, data[v_start:v_end])
-        out.append(VarBind(oid, resolver.name(oid), type_name, value))
+        out.append(VarBind(oid, resolver.name(oid), type_name, value, bytes(data[v_start:v_end])))
         pos = vb_end
     return out
 
@@ -118,7 +131,7 @@ def parse_notification_pdu(data: bytes, pdu_tag: int, p_start: int, p_end: int,
     for vb in _read_varbinds(data, vl_start, vl_end, resolver):
         if vb.oid == SYS_UPTIME_0 and uptime is None:
             uptime = vb.value if isinstance(vb.value, int) else None
-        elif vb.oid == SNMP_TRAP_OID_0 and not trap_oid and vb.type == "ObjectIdentifier":
+        elif vb.oid == SNMP_TRAP_OID_0 and not trap_oid and vb.type == "Object Identifier":
             trap_oid = vb.value
         else:
             varbinds.append(vb)

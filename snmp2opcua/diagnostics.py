@@ -144,6 +144,10 @@ def is_admin() -> bool | None:
         return None
 
 
+def _n(count: int, word: str) -> str:
+    return f"{count:,} {word}{'' if count == 1 else 's'}"
+
+
 def _ago(seconds: float) -> str:
     seconds = int(seconds)
     if seconds < 60:
@@ -204,23 +208,27 @@ def run_diagnostics(ctl, tk_version: str | None = None) -> list[Check]:
     # ---------------------------------------------------------------- SNMP listener
     sec = "SNMP listener"
     if cfg is not None:
+        from .config import listen_endpoints
         host, port = snmp["listen_host"], int(snmp["listen_port"])
-        if running:
-            add(sec, "UDP port", "ok", f"This gateway is listening on {host}:{port}")
-        else:
-            state, detail = udp_port_status(host, port)
+        endpoints = listen_endpoints(cfg)
+        for ep_host, ep_port, proto in endpoints:
+            label = "UDP port" if len(endpoints) == 1 else f"{proto} {ep_host}:{ep_port}"
+            if running:
+                add(sec, label, "ok", f"This gateway is listening on {proto} {ep_host}:{ep_port}")
+                continue
+            state, detail = (udp_port_status if proto == "UDP" else tcp_port_status)(ep_host, ep_port)
             if state == "free":
-                add(sec, "UDP port", "ok", f"{host}:{port} is free; the gateway can listen there")
+                add(sec, label, "ok", f"{proto} {ep_host}:{ep_port} is free; the gateway can listen there")
             elif state == "in_use":
-                add(sec, "UDP port", "problem", f"{host}:{port} is already in use by another program",
-                    "Stop the other trap receiver (snmptrapd, or the Windows 'SNMP Trap' service), "
-                    "or choose another port in the configuration.")
+                add(sec, label, "problem", f"{ep_host}:{ep_port} ({proto}) is already in use by another program",
+                    "Unable to bind trap socket: close the other application (e.g. snmptrapd), make sure the "
+                    "Windows SNMP Trap service is not running, or select a different address or port.")
             elif state == "no_permission":
-                add(sec, "UDP port", "problem", f"Not allowed to listen on port {port}",
+                add(sec, label, "problem", f"Not allowed to listen on port {ep_port}",
                     "Ports below 1024 need administrator/root rights (Linux: CAP_NET_BIND_SERVICE). "
                     "Run as administrator, or use a port such as 1162.")
             else:
-                add(sec, "UDP port", "problem", f"Can't listen on {host}:{port}: {detail}",
+                add(sec, label, "problem", f"Can't listen on {ep_host}:{ep_port}: {detail}",
                     "listen_host must be an address of this machine, or 0.0.0.0 for all of them.")
         addrs = local_addresses()
         if host.startswith("127.") or host in ("::1", "localhost"):
@@ -233,11 +241,17 @@ def run_diagnostics(ctl, tk_version: str | None = None) -> list[Check]:
             add(sec, "Send traps to", "info", ", ".join(f"{a}:{port}" for a in addrs),
                 "Configure these as the trap destination on your devices. Check that the firewall allows "
                 f"UDP {port} inbound.")
-        if snmp["allowed_sources"]:
-            add(sec, "Allowed sources", "ok", ", ".join(map(str, snmp["allowed_sources"])))
+        accept_all = snmp.get("accept_all_hosts")
+        if accept_all is None:
+            accept_all = not snmp["allowed_sources"]
+        if accept_all:
+            add(sec, "Accepted hosts", "info", "Packets are accepted from all hosts",
+                "Set accept_all_hosts: false and list your devices under snmp.allowed_sources for extra safety.")
+        elif snmp["allowed_sources"]:
+            add(sec, "Accepted hosts", "ok", ", ".join(map(str, snmp["allowed_sources"])))
         else:
-            add(sec, "Allowed sources", "info", "Any address may send traps",
-                "Restrict snmp.allowed_sources to your device subnets for extra safety.")
+            add(sec, "Accepted hosts", "problem", "accept_all_hosts is off and no host is listed, so every trap "
+                "is rejected", "Add the device addresses under snmp.allowed_sources, or set accept_all_hosts: true.")
         if {"v1", "v2c"} & set(snmp["versions"]):
             comm = snmp["communities"]
             if not comm:
@@ -248,6 +262,55 @@ def run_diagnostics(ctl, tk_version: str | None = None) -> list[Check]:
                     "Use a community string of your own on devices and in snmp.communities.")
             else:
                 add(sec, "Communities", "ok", f"{len(comm)} configured")
+
+    # ---------------------------------------------------------------- devices (trap tags)
+    sec = "Devices"
+    if cfg is not None:
+        devices = cfg.get("_devices") or []
+        if not devices:
+            add(sec, "Devices", "info", "No channels or devices configured; traps are still published under "
+                "Gateway/LastTrap and as events", "Add channels and devices to get trap tags such as "
+                "Channel1.Switch1.linkDown (see the README).")
+        else:
+            n_tags = sum(len(d.tags) for d in devices)
+            add(sec, "Channels / devices / tags", "info",
+                f"{len({d.channel for d in devices})} / {len(devices)} / {n_tags:,}")
+        live = {d["path"]: d for d in snap.get("devices") or []}
+        for dev in devices:
+            st = live.get(dev.path)
+            name = f"Device {dev.path}"
+            if not dev.trap_enabled:
+                add(sec, name, "info", "Trap/Inform support is disabled for this device")
+                continue
+            if st and st["error"]:
+                add(sec, name, "problem", st["error"], "Use the device's IP address, or fix host name resolution.")
+                continue
+            sec_txt = f"v3 user {dev.v3_user.name}" if dev.v3_user else (
+                "Custom Community" if dev.community else "any community")
+            where = f"{dev.host}, SNMP v{dev.snmp_version}, {sec_txt}, {dev.protocol} {dev.port}"
+            if not running or st is None:
+                add(sec, name, "info", where)
+            elif st["ignored"] and not st["count"]:
+                add(sec, name, "warn", f"{where}: {_n(st['ignored'], 'trap')} ignored, none accepted. Last reason: "
+                    f"{st['last_reason']}", "Make the device's SNMP version, community or v3 user match what "
+                    "the device actually sends.")
+            elif st["count"]:
+                extra = f"; {st['ignored']} ignored ({st['last_reason']})" if st["ignored"] else ""
+                add(sec, name, "warn" if st["ignored"] else "ok",
+                    f"{where}: {_n(st['count'], 'trap')}, last at {st['last_trap']}{extra}",
+                    "Some traps from this address don't match the device settings." if st["ignored"] else "")
+            else:
+                add(sec, name, "info", f"{where}: no traps yet",
+                    "Configure the device to send traps to this computer's address and port.")
+        for ip, n in sorted((snap.get("unmatched") or {}).items(), key=lambda kv: -kv[1])[:10]:
+            if devices:
+                add(sec, f"Traps from {ip}", "warn", f"{_n(n, 'trap')} from an address that isn't a configured device",
+                    "They're still published under Gateway/LastTrap. To get trap tags, add a device with "
+                    f"ip: {ip}.")
+        for (ip, agent), (when, descr) in sorted(ctl.kepware_agents.items(), key=lambda kv: str(kv[0])):
+            add(sec, f"Kepware SNMP Agent at {ip}", "info",
+                f"agent sub-identifier {agent if agent is not None else '?'}, last trap {when}"
+                + (f": {descr}" if descr else ""))
 
     # ---------------------------------------------------------------- SNMPv3
     sec = "SNMPv3"

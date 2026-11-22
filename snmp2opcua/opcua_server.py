@@ -7,6 +7,10 @@ Address space (namespace index is usually 2):
     LastTrap/ SourceIP, Version, PduType, SecurityName, TrapOID, TrapName, Uptime, ReceivedAt, VarBindsJson, Json
     RecentTrapsJson                             JSON array of the last N traps (newest first)
     Devices/<source-ip>/ TrapCount, LastTrapOID, LastTrapName, LastTrapTime, LastTrapJson
+
+  Objects/<Channel>/<Device>/<Tag>              ns=2;s=Channel.Device.Tag   (SNMP-driver style trap tags)
+    trap tags (Boolean, writable: write 0 to reset), table fields [n], EVENTS_COUNT (writable),
+    EVENTS_001.., EVENTS_nnn_FLDCNT, EVENTS_nnn_mmm; tag groups ("Group.Tag") become folders
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ from asyncua import Server, ua
 
 from .receiver import Stats
 from .severity import SeverityMap
+from .snmp_driver import OPCUA_TYPES, DeviceDef
 from .trap import Trap
 
 log = logging.getLogger("snmp2opcua.opcua_server")
@@ -30,9 +35,14 @@ DT = ua.VariantType.DateTime
 
 
 class OpcUaServerPublisher:
-    def __init__(self, cfg: dict, severity: SeverityMap):
+    def __init__(self, cfg: dict, severity: SeverityMap, devices: list[DeviceDef] | None = None):
         self.cfg = cfg
         self.severity = severity
+        self.devices_cfg = devices or []
+        self.tag_nodes: dict[str, tuple[object, object]] = {}   # path -> (node, variant type)
+        self.writable_paths: set[str] = set()
+        self.engine = None                                      # set by the gateway (for client resets)
+        self._reset_sub = None
         self.server: Server | None = None
         self.idx = 2
         self.recent: deque[dict] = deque(maxlen=int(cfg.get("recent_traps", 50)))
@@ -117,9 +127,80 @@ class OpcUaServerPublisher:
             )
             self.evgen = await server.get_event_generator(etype, gw)
 
+        await self._build_driver_tree(objects)
+
         self.server = server
         await server.start()
+        await self._watch_resets()
         log.info("OPC UA server running at %s (namespace index %d)", cfg["endpoint"], self.idx)
+
+    async def _build_driver_tree(self, objects) -> None:
+        """Channel -> Device -> Tag, with Kepware-style string NodeIds ns=<idx>;s=Channel.Device.Tag."""
+        folders: dict[str, object] = {}
+
+        async def folder(path: str):
+            if path in folders:
+                return folders[path]
+            parent_path, _, name = path.rpartition(".")
+            parent = await folder(parent_path) if parent_path else objects
+            node = await parent.add_folder(self._nid(path), self._qn(name))
+            folders[path] = node
+            return node
+
+        for dev in self.devices_cfg:
+            await folder(dev.path)
+            for tag in dev.tags:
+                path = dev.tag_path(tag)
+                parent_path, _, name = path.rpartition(".")
+                parent = await folder(parent_path)
+                vtype = getattr(ua.VariantType, OPCUA_TYPES[tag.data_type])
+                initial = {"Boolean": False, "String": "", "Int32": 0, "UInt32": 0}[OPCUA_TYPES[tag.data_type]]
+                node = await parent.add_variable(self._nid(path), self._qn(name), initial, varianttype=vtype)
+                if tag.writable:
+                    await node.set_writable()
+                    self.writable_paths.add(path)
+                self.tag_nodes[path] = (node, vtype)
+        if self.tag_nodes:
+            log.info("Created %d trap tags for %d devices", len(self.tag_nodes), len(self.devices_cfg))
+
+    async def _watch_resets(self) -> None:
+        """Notice when an OPC UA client writes 0 to a trap tag or EVENTS_COUNT, to keep the engine in step."""
+        writable = [(p, self.tag_nodes[p][0]) for p in sorted(self.writable_paths)]
+        if not writable or self.server is None:
+            return
+        paths = {n.nodeid: p for p, n in writable}
+        outer = self
+
+        class Handler:
+            def datachange_notification(self, node, val, data):
+                if not val and outer.engine is not None:
+                    outer.engine.reset(paths.get(node.nodeid, ""))
+
+        try:
+            self._reset_sub = await self.server.create_subscription(500, Handler())
+            await self._reset_sub.subscribe_data_change([n for _, n in writable])
+        except Exception:
+            log.debug("Could not watch trap tag resets", exc_info=True)
+
+    async def _apply_tag_updates(self, trap: Trap) -> None:
+        for u in trap.tag_updates:
+            entry = self.tag_nodes.get(u.path)
+            if entry is None:
+                continue
+            node, vtype = entry
+            if u.op == "inc":
+                try:
+                    current = int(await node.read_value() or 0)
+                except Exception:
+                    current = 0
+                await self._write(node, (current + 1) & 0xFFFFFFFF, vtype)
+            else:
+                value = u.value
+                if vtype == ua.VariantType.UInt32:
+                    value = int(value) & 0xFFFFFFFF
+                elif vtype == ua.VariantType.Int32:
+                    value = max(-2**31, min(2**31 - 1, int(value)))
+                await self._write(node, value, vtype)
 
     async def stop(self) -> None:
         if self.server is not None:
@@ -149,6 +230,7 @@ class OpcUaServerPublisher:
         return dev
 
     async def publish(self, trap: Trap) -> None:
+        await self._apply_tag_updates(trap)
         n = self.nodes
         trap_json = trap.to_json()
         varbinds_json = trap.varbinds_json()
@@ -191,7 +273,7 @@ class OpcUaServerPublisher:
     def diagnostics(self) -> dict:
         return {"kind": "server", "endpoint": self.cfg["endpoint"], "running": self.server is not None,
                 "namespace_index": self.idx, "devices": len(self.devices), "max_devices": self.max_devices,
-                "events": self.evgen is not None}
+                "events": self.evgen is not None, "trap_tags": len(self.tag_nodes)}
 
     async def update_status(self, stats: Stats) -> None:
         if self.server is None:

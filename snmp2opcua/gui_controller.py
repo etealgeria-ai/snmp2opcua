@@ -93,6 +93,7 @@ class GatewayController:
         self.publisher_factory = None      # tests can inject a fake OPC UA publisher
         self.trap_times: deque[float] = deque(maxlen=20000)   # monotonic receive times, for rates
         self.last_trap_at: datetime | None = None
+        self.kepware_agents: dict[tuple[str, int | None], tuple[str, str]] = {}   # (ip, agent) -> (time, descr)
         self.log_handler = QueueLogHandler(self.events)
         root = logging.getLogger()
         if self.log_handler not in root.handlers:
@@ -168,6 +169,9 @@ class GatewayController:
 
     @staticmethod
     def _explain(exc: BaseException, cfg: dict) -> str:
+        from .receiver import ListenerError
+        if isinstance(exc, ListenerError):
+            return exc.strerror or str(exc)
         port = cfg["snmp"]["listen_port"]
         if isinstance(exc, PermissionError):
             return (f"No permission to listen on UDP port {port}. Run as administrator/root, "
@@ -194,7 +198,11 @@ class GatewayController:
             d["severity"] = sev
             d["severity_label"] = severity_label(sev)
             d["time"] = payload.received_at.astimezone().strftime("%H:%M:%S")
+            if d.get("vendor"):
+                self.kepware_agents[(d["source_ip"], d.get("agent_id"))] = (d["time"], d.get("description", ""))
             self.events.put(("trap", d))
+        elif kind == "tags":
+            self.events.put(("tags", list(payload)))
         else:
             payload = dict(payload, time=datetime.now().strftime("%H:%M:%S"))
             self.events.put((kind, payload))
@@ -243,6 +251,14 @@ class GatewayController:
                     "counters": dict(v3.counters), "remote": v3.remote_engines(),
                     "replay_protection": v3.replay_protection},
                 "publisher": pub.diagnostics() if hasattr(pub, "diagnostics") else {},
+                "devices": [{
+                    "path": d.path, "host": d.host, "resolved": st.resolved, "error": st.error,
+                    "enabled": d.trap_enabled, "version": d.snmp_version, "port": d.port, "protocol": d.protocol,
+                    "community": bool(d.community), "count": st.count, "ignored": st.ignored,
+                    "last_reason": st.last_reason,
+                    "last_trap": st.last_trap.astimezone().strftime("%H:%M:%S") if st.last_trap else None}
+                    for d in gw.engine.devices for st in [gw.engine.state[d.path]]],
+                "unmatched": dict(gw.engine.unmatched),
             }
         try:
             return asyncio.run_coroutine_threadsafe(collect(), loop).result(timeout=3)

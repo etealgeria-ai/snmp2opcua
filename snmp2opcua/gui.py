@@ -29,6 +29,8 @@ except ImportError:  # pragma: no cover - reported in main()
 
 from .diagnostics import STATUS_LABEL, Check, report_text, run_diagnostics, summarize
 from .gui_controller import GatewayController, TrapRequest, parse_varbind_lines
+from .snmp_driver import DeviceDef, EventsAddress
+from .tag_csv import TagCsvError, read_tags, write_tags
 from .usm import AUTH_PROTOCOLS, PRIV_PROTOCOLS, UsmUser
 
 # Neutral console palette; colour is reserved for abnormal states
@@ -83,6 +85,8 @@ class GatewayApp:
         self.diag_checks: list[Check] = []
         self.diag_when: datetime | None = None
         self.diag_by_iid: dict[str, Check] = {}
+        self.tag_values: dict[str, tuple[object, bool, str]] = {}   # path -> (value, good, time)
+        self.tag_devices: list[DeviceDef] = []
 
         self._setup_style()
         self._build()
@@ -193,6 +197,7 @@ class GatewayApp:
         self.nb = ttk.Notebook(root)
         self.nb.pack(side="top", fill="both", expand=True, padx=12)
         self.tab_traps = self._build_traps_tab()
+        self.tab_tags = self._build_tags_tab()
         self.tab_devices = self._build_devices_tab()
         self.tab_rejected = self._build_rejected_tab()
         self.tab_diag = self._build_diag_tab()
@@ -258,8 +263,8 @@ class GatewayApp:
         top = ttk.Frame(pane)
         self.trap_tree = self._make_tree(top, [
             ("time", "Time", 80, False), ("source", "Source", 130, False), ("version", "Version", 64, False),
-            ("user", "v3 user", 100, False), ("trap", "Trap", 240, True), ("severity", "Severity", 110, False),
-            ("varbinds", "Variables", 420, True)])
+            ("user", "v3 user", 100, False), ("trap", "Trap", 220, True), ("description", "Description", 220, True),
+            ("severity", "Severity", 110, False), ("varbinds", "Variables", 380, True)])
         self.trap_tree.tag_configure("high", background=ALARM_TINT)
         self.trap_tree.tag_configure("medium", background=WARN_TINT)
         self.trap_tree.bind("<<TreeviewSelect>>", self._show_trap_detail)
@@ -272,12 +277,192 @@ class GatewayApp:
         pane.add(bottom, weight=1)
         return tab
 
+    # ------------------------------------------------------------------ tags tab
+    def _build_tags_tab(self) -> ttk.Frame:
+        tab = ttk.Frame(self.nb, padding=(0, 10, 0, 0))
+        self.nb.add(tab, text="Tags")
+        bar = ttk.Frame(tab)
+        bar.pack(side="top", fill="x", pady=(0, 8))
+        ttk.Label(bar, text="Filter").pack(side="left")
+        self.tag_filter = tk.StringVar()
+        self.tag_filter.trace_add("write", lambda *_: self._rebuild_tag_tree())
+        ttk.Entry(bar, textvariable=self.tag_filter, width=28).pack(side="left", padx=(6, 0))
+        self.tag_show_all = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Show table fields and the whole events queue", variable=self.tag_show_all,
+                        command=self._rebuild_tag_tree).pack(side="left", padx=(14, 0))
+        ttk.Button(bar, text="Export tags CSV…", command=self.export_tags).pack(side="right")
+        ttk.Button(bar, text="Import tags CSV…", command=self.import_tags).pack(side="right", padx=(0, 6))
+        box = ttk.Frame(tab)
+        box.pack(side="top", fill="both", expand=True)
+        tree = ttk.Treeview(box, columns=["address", "type", "value", "quality", "updated"], show="tree headings",
+                            selectmode="browse")
+        tree.heading("#0", text="Name", anchor="w")
+        tree.column("#0", width=260, minwidth=120, stretch=False, anchor="w")
+        for cid, head, width, stretch in (("address", "Address", 330, False), ("type", "Data type", 80, False),
+                                          ("value", "Value", 360, True), ("quality", "Quality", 70, False),
+                                          ("updated", "Updated", 90, False)):
+            tree.heading(cid, text=head, anchor="w")
+            tree.column(cid, width=width, minwidth=50, stretch=stretch, anchor="w")
+        ys = ttk.Scrollbar(box, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=ys.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        box.rowconfigure(0, weight=1)
+        box.columnconfigure(0, weight=1)
+        tree.tag_configure("device", font=self.f_head)
+        tree.tag_configure("bad", background=WARN_TINT)
+        self.tag_tree = tree
+        self.empty_tags = tk.Label(box, background=FIELD, foreground=MUTED, font=self.f_base, justify="center",
+                                   text="No devices configured.\nAdd channels and devices with trap tags in the "
+                                        "Configuration tab (see the README), or import a tags CSV.")
+        self.empty_tags.place(relx=0.5, rely=0.5, anchor="center")
+        self.tag_info = ttk.Label(tab, text="", style="Small.TLabel", wraplength=900, justify="left")
+        self.tag_info.pack(side="top", fill="x", pady=(6, 0))
+        tree.bind("<<TreeviewSelect>>", self._on_tag_select)
+        return tab
+
+    @staticmethod
+    def _shown_by_default(tag) -> bool:
+        a = tag.address
+        if isinstance(a, EventsAddress):
+            return a.event is None or (a.event == 1 and a.field_no is None)
+        return not tag.auto or a.index is None
+
+    @staticmethod
+    def _fmt_value(value) -> str:
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        return "" if value is None else str(value)
+
+    def _rebuild_tag_tree(self) -> None:
+        tree = self.tag_tree
+        tree.delete(*tree.get_children())
+        needle = self.tag_filter.get().strip().lower()
+        channels: dict[str, str] = {}
+        for dev in self.tag_devices:
+            ch_iid = channels.get(dev.channel)
+            if ch_iid is None:
+                ch_iid = channels[dev.channel] = f"ch:{dev.channel}"
+                tree.insert("", "end", iid=ch_iid, text=dev.channel, open=True, tags=("device",),
+                            values=("", "", "", "", ""))
+            proto = f"{dev.protocol} {dev.port}" if dev.trap_enabled else "traps disabled"
+            dev_iid = f"dev:{dev.path}"
+            tree.insert(ch_iid, "end", iid=dev_iid, text=dev.name, open=True, tags=("device",),
+                        values=(f"{dev.host}   SNMP v{dev.snmp_version}   {proto}", "", "", "", ""))
+            for tag in dev.tags:
+                if not (self.tag_show_all.get() or self._shown_by_default(tag)):
+                    continue
+                path = dev.tag_path(tag)
+                if needle and needle not in path.lower() and needle not in tag.address.text().lower():
+                    continue
+                initial = {"Boolean": False, "String": "", "Long": 0, "DWord": 0}[tag.data_type]
+                value, good, when = self.tag_values.get(path, (initial, True, ""))
+                tree.insert(dev_iid, "end", iid=f"tag:{path}", text=tag.name, tags=() if good else ("bad",),
+                            values=(tag.address.text(), tag.data_type, self._fmt_value(value),
+                                    "Good" if good else "Bad", when))
+        if self.tag_devices:
+            self.empty_tags.place_forget()
+        else:
+            self.empty_tags.place(relx=0.5, rely=0.5, anchor="center")
+        n = sum(len(d.tags) for d in self.tag_devices)
+        self.nb.tab(self.tab_tags, text=f"Tags ({n:,})" if n else "Tags")
+
+    def _on_tags(self, updates: list) -> None:
+        now = datetime.now().strftime("%H:%M:%S")
+        for path, value, good in updates:
+            self.tag_values[path] = (value, good, now)
+            iid = f"tag:{path}"
+            if self.tag_tree.exists(iid):
+                row = self.tag_tree.item(iid)["values"]
+                self.tag_tree.item(iid, values=(row[0], row[1], self._fmt_value(value), "Good" if good else "Bad",
+                                                now), tags=() if good else ("bad",))
+
+    def _selected_device(self) -> DeviceDef | None:
+        sel = self.tag_tree.selection()
+        if not sel:
+            return self.tag_devices[0] if len(self.tag_devices) == 1 else None
+        iid = sel[0]
+        for dev in self.tag_devices:
+            if iid == f"dev:{dev.path}" or iid.startswith(f"tag:{dev.path}."):
+                return dev
+        return None
+
+    def _on_tag_select(self, _event=None) -> None:
+        dev = self._selected_device()
+        if dev is None:
+            self.tag_info.configure(text="")
+            return
+        comm = "Custom Community set" if dev.community else "any community"
+        sec = f"v3 user {dev.v3_user.name} ({dev.v3_user.level})" if dev.v3_user else comm
+        ascii_note = ", extended ASCII" if dev.extended_ascii else ""
+        self.tag_info.configure(text=f"{dev.path}: traps from {dev.host}, SNMP v{dev.snmp_version}, {sec}, "
+                                     f"{dev.protocol} port {dev.port}, {dev.number_of_events} events of "
+                                     f"{dev.number_of_fields} fields{ascii_note}.")
+
+    def export_tags(self) -> None:
+        dev = self._selected_device()
+        if dev is None:
+            messagebox.showinfo("Export tags", "Select a device (or one of its tags) first.", parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(parent=self.root, title=f"Export tags of {dev.path}",
+                                            defaultextension=".csv", filetypes=[("CSV", "*.csv")],
+                                            initialfile=f"{dev.channel}_{dev.name}_tags.csv")
+        if not path:
+            return
+        try:
+            n = write_tags(dev.tags, path)
+        except OSError as exc:
+            messagebox.showerror("Export tags", f"Couldn't write {path}: {exc}", parent=self.root)
+            return
+        self.status_line.configure(text=f"Exported {n} tags of {dev.path} to {path} (auto-created tags left out)")
+
+    def _device_cfg(self, dev: DeviceDef) -> dict | None:
+        for c in (self.ctl.cfg or {}).get("channels") or []:
+            if c.get("name") == dev.channel:
+                return next((d for d in c.get("devices") or [] if d.get("name") == dev.name), None)
+        return None
+
+    def import_tags(self) -> None:
+        dev = self._selected_device()
+        if dev is None:
+            messagebox.showinfo("Import tags", "Select the device to import into first.", parent=self.root)
+            return
+        raw = self._device_cfg(dev) or {}
+        target = raw.get("tags_csv")
+        if not target:
+            messagebox.showinfo("Import tags", f"Add a line  tags_csv: {dev.channel}_{dev.name}_tags.csv  to device "
+                                f"{dev.path} in the Configuration tab and save, then import again.", parent=self.root)
+            return
+        src = filedialog.askopenfilename(parent=self.root, title=f"Import tags into {dev.path}",
+                                         filetypes=[("CSV", "*.csv"), ("All files", "*")])
+        if not src:
+            return
+        try:
+            tags, skipped = read_tags(src, dev.path)
+        except (TagCsvError, OSError, UnicodeDecodeError) as exc:
+            detail = "\n".join(exc.problems[:15]) if isinstance(exc, TagCsvError) else str(exc)
+            messagebox.showerror("Import tags", f"Nothing was imported:\n{detail}", parent=self.root)
+            return
+        dest = Path(target)
+        if not dest.is_absolute():
+            dest = self.ctl.config_path.resolve().parent / dest
+        try:
+            if dest.exists():
+                dest.with_suffix(dest.suffix + ".bak").write_bytes(dest.read_bytes())
+            dest.write_text(Path(src).read_text(encoding="utf-8-sig"), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Import tags", f"Couldn't write {dest}: {exc}", parent=self.root)
+            return
+        note = f" {len(skipped)} rows without trap addresses were skipped." if skipped else ""
+        self.status_line.configure(text=f"Imported {len(tags)} tags into {dest.name} for {dev.path}.{note} "
+                                        f"Use Save and restart (Configuration tab) to apply.")
+
     # ------------------------------------------------------------------ devices tab
     def _build_devices_tab(self) -> ttk.Frame:
         tab = ttk.Frame(self.nb, padding=(0, 10, 0, 0))
-        self.nb.add(tab, text="Devices")
+        self.nb.add(tab, text="Sources")
         self.device_tree = self._make_tree(tab, [
-            ("source", "Device", 170, False), ("count", "Traps", 80, False),
+            ("source", "Source address", 170, False), ("count", "Traps", 80, False),
             ("last", "Last trap", 320, True), ("seen", "Last seen", 120, False), ("version", "Version", 80, False)])
         self.device_tree.tag_configure("high", background=ALARM_TINT)
         return tab
@@ -488,6 +673,11 @@ class GatewayApp:
 
     def _refresh_from_config(self, cfg: dict) -> None:
         """Update form defaults and hints from a loaded config (never touches the editor)."""
+        devices = list(cfg.get("_devices") or [])
+        if [d.path for d in devices] != [d.path for d in self.tag_devices] or \
+                [len(d.tags) for d in devices] != [len(d.tags) for d in self.tag_devices]:
+            self.tag_devices = devices
+            self._rebuild_tag_tree()
         snmp = cfg["snmp"]
         self.t_port.set(str(snmp["listen_port"]))
         if snmp.get("communities"):
@@ -593,7 +783,9 @@ class GatewayApp:
         self.btn_stop.configure(state="normal")
         self._show_state("running", "Running")
         versions = ", ".join(info.get("versions") or [])
-        self.info_listen.configure(text=f"Listening on UDP {info.get('listen')} for SNMP {versions}")
+        listen = info.get("listen") or []
+        listen = ", ".join(listen) if isinstance(listen, list) else str(listen)
+        self.info_listen.configure(text=f"Listening on {listen} for SNMP {versions}")
         mode = "server" if info.get("mode") == "server" else "client, writing to"
         self.info_opcua.configure(text=f"OPC UA {mode} {info.get('opcua')}")
         if self.ctl.cfg:
@@ -655,6 +847,8 @@ class GatewayApp:
             self._on_test_result(*payload)
         elif kind == "diag_result":
             self._on_diag_result(payload)
+        elif kind == "tags":
+            self._on_tags(payload)
 
     def _tick(self) -> None:
         stats = self.ctl.stats()
@@ -673,7 +867,7 @@ class GatewayApp:
 
     def _trap_values(self, d: dict) -> tuple:
         return (d["time"], d["source_ip"], d["version"], d.get("security_name", ""), d["trap_name"],
-                f"{d['severity']}  {d['severity_label']}", self._varbind_summary(d))
+                d.get("description", ""), f"{d['severity']}  {d['severity_label']}", self._varbind_summary(d))
 
     @staticmethod
     def _tag_for(d: dict) -> tuple[str, ...]:
@@ -783,7 +977,7 @@ class GatewayApp:
             self.device_tree.move(iid, "", 0)
         else:
             self.device_tree.insert("", 0, iid=iid, values=values, tags=tags)
-        self.nb.tab(self.tab_devices, text=f"Devices ({len(self.devices)})")
+        self.nb.tab(self.tab_devices, text=f"Sources ({len(self.devices)})")
 
     def _add_rejection(self, kind: str, p: dict) -> None:
         self.reject_count += 1

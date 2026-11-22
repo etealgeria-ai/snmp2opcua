@@ -74,7 +74,7 @@ class ControllerTests(unittest.TestCase):
     def test_full_cycle(self):
         self.ctl.start()
         info = self.wait_for("started")
-        self.assertEqual(info["listen"], f"127.0.0.1:{self.port}")
+        self.assertEqual(info["listen"], [f"UDP 127.0.0.1:{self.port}"])
         self.assertEqual(info["mode"], "server")
         self.assertTrue(info["engine_id"])
         users = self.ctl.configured_users()

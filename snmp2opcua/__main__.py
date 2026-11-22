@@ -34,8 +34,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"Invalid config: {exc}", file=sys.stderr)
         return 2
-    if args.port:
+    if args.port:          # one listener on this port instead of the configured network interfaces
         cfg["snmp"]["listen_port"] = args.port
+        cfg["snmp"]["network_interfaces"] = []
 
     level = (args.log_level or cfg["logging"].get("level", "INFO")).upper()
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")

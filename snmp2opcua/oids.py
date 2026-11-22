@@ -45,6 +45,9 @@ BUILTIN_NAMES: dict[str, str] = {
     "1.3.6.1.2.1.33.2.0.4": "upsTrapAlarmEntryRemoved",
     "1.3.6.1.2.1.17.0.1": "newRoot",
     "1.3.6.1.2.1.17.0.2": "topologyChange",
+    # Kepware / PTC (KEPServerEX SNMP Agent Plug-In); system objects are named in kepware.py
+    "1.3.6.1.4.1.30144": "kepware",
+    "1.3.6.1.4.1.30144.12": "kepwareSnmpAgent",
 }
 
 
