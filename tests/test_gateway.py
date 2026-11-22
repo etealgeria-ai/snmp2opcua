@@ -145,7 +145,8 @@ class MappingTests(unittest.TestCase):
     def test_severity(self):
         sm = SeverityMap({"default": 300, "rules": {"linkDown": 800, "1.3.6.1.4.1.9": 600,
                                                      "1.3.6.1.4.1.9.9.41": 900, "x": 5000}})
-        mk = lambda oid: parse_message(build_v2("public", oid, 1, []), SRC, R)
+        def mk(oid):
+            return parse_message(build_v2("public", oid, 1, []), SRC, R)
         self.assertEqual(sm.for_trap(mk("linkDown")), 800)
         self.assertEqual(sm.for_trap(mk("1.3.6.1.4.1.9.9.41.2.0.1")), 900)
         self.assertEqual(sm.for_trap(mk("1.3.6.1.4.1.9.1.0.5")), 600)

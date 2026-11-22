@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+from typing import Any, Callable
 
 from .oids import OidResolver
 from .receiver import Stats, TrapProtocol, start_listener
@@ -33,8 +34,9 @@ class Gateway:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=int(cfg["traps"]["queue_size"]))
         self.publisher = publisher if publisher is not None else make_publisher(cfg)
         self.resolver = OidResolver(cfg["traps"].get("oid_names"))
-        self.transport = None
+        self.transport: asyncio.DatagramTransport | None = None
         self.v3: SnmpV3Engine | None = None
+        self.monitor: Callable[[str, Any], None] | None = None   # set by the desktop UI
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -87,9 +89,15 @@ class Gateway:
                 loop, snmp["listen_host"], int(snmp["listen_port"]),
                 lambda: TrapProtocol(self.queue, self.stats, self.resolver, snmp["communities"],
                                      snmp["allowed_sources"], snmp["respond_to_informs"],
-                                     v3=self.v3, versions=snmp["versions"]),
+                                     v3=self.v3, versions=snmp["versions"], monitor=self.monitor),
             )
             tasks = [asyncio.create_task(self._consume()), asyncio.create_task(self._status_loop())]
+            if self.monitor is not None:
+                self.monitor("started", {
+                    "listen": f"{snmp['listen_host']}:{snmp['listen_port']}",
+                    "versions": list(snmp["versions"]),
+                    "engine_id": self.v3.engine_id.hex() if self.v3 else None,
+                })
             await self._stop.wait()
             log.info("Shutting down")
         except PermissionError:

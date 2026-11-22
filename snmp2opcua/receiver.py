@@ -31,7 +31,7 @@ class Stats:
 class TrapProtocol(asyncio.DatagramProtocol):
     def __init__(self, queue: asyncio.Queue, stats: Stats, resolver: OidResolver,
                  communities: list[str], allowed_sources: list[str], respond_to_informs: bool = True,
-                 v3: SnmpV3Engine | None = None, versions: list[str] | None = None):
+                 v3: SnmpV3Engine | None = None, versions: list[str] | None = None, monitor=None):
         self.queue = queue
         self.stats = stats
         self.resolver = resolver
@@ -41,6 +41,14 @@ class TrapProtocol(asyncio.DatagramProtocol):
         self.v3 = v3
         self.versions = set(versions or ["v1", "v2c", "v3"])
         self.transport: asyncio.DatagramTransport | None = None
+        self.monitor = monitor          # optional callable(kind, payload) for UIs
+
+    def _notify(self, kind: str, payload) -> None:
+        if self.monitor is not None:
+            try:
+                self.monitor(kind, payload)
+            except Exception:
+                log.debug("monitor callback failed", exc_info=True)
 
     def connection_made(self, transport):
         self.transport = transport
@@ -66,6 +74,7 @@ class TrapProtocol(asyncio.DatagramProtocol):
     def _reject(self, ip: str, reason: str) -> None:
         self.stats.rejected += 1
         log.warning("Rejected packet from %s: %s", ip, reason)
+        self._notify("rejected", {"source": ip, "reason": reason})
 
     def datagram_received(self, data: bytes, addr):
         ip = addr[0]
@@ -95,14 +104,17 @@ class TrapProtocol(asyncio.DatagramProtocol):
         except (ber.BerError, UnsupportedMessage, UsmError) as exc:
             self.stats.malformed += 1
             log.warning("Ignored packet from %s: %s", ip, exc)
+            self._notify("malformed", {"source": ip, "reason": str(exc)})
             return
-        except Exception:  # never let one bad packet kill the listener
+        except Exception as exc:  # never let one bad packet kill the listener
             self.stats.malformed += 1
             log.exception("Unexpected error decoding packet from %s", ip)
+            self._notify("malformed", {"source": ip, "reason": f"unexpected error: {exc}"})
             return
 
         self.stats.received += 1
         log.info("%s", trap.summary())
+        self._notify("trap", trap)
         try:
             self.queue.put_nowait(trap)
         except asyncio.QueueFull:

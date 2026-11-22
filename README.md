@@ -21,6 +21,7 @@ It has two modes:
 - OPC UA event severity is mapped per trap name or OID prefix
 - Each source device gets its own node with a trap count and its last trap
 - A bounded queue holds traps while OPC UA is slow or unreachable. In client mode the gateway reconnects automatically
+- **Desktop window** to start and stop the gateway, watch traps arrive, see why packets were rejected, send test traps and edit the configuration
 - Runs on Linux and Windows, Python 3.9+ (tested on 3.13)
 
 ## Install and run
@@ -100,6 +101,27 @@ The target nodes must already exist and be writable. The gateway reads each node
 
 If the server goes down, traps wait in the queue (`traps.queue_size`) and are written after the gateway reconnects. If a write is rejected (wrong type, no access), the gateway logs it and skips that node.
 
+## Desktop window
+
+```bash
+python -m snmp2opcua.gui -c config.yaml           # add --start to start the gateway right away
+python -m snmp2opcua --gui -c config.yaml         # same thing
+```
+
+On Windows you can also double-click `run_gui.pyw`, which uses the `config.yaml` next to it. The window uses Tkinter, which comes with Python from python.org. On Debian/Ubuntu, install it with `sudo apt install python3-tk`.
+
+- **Toolbar:** *Start gateway* / *Stop gateway*, the config file in use, and the gateway's state. Under it you'll see the UDP address being listened on and the OPC UA endpoint or target server.
+- **Counters:** received, published to OPC UA, waiting to publish, rejected, unreadable and dropped. A counter gets an amber or red stripe and a ⚠ label only when something needs attention. Everything else stays grey, following high-performance HMI practice (ISA-101).
+- **Traps:** a live list, newest first.
+  - High-severity rows (800 or more) are tinted red and medium ones (600–799) amber. The severity number and label are always shown as text as well.
+  - You can filter by any text (source, trap name, numeric OID, v3 user, values), pause the feed, and export to CSV.
+  - Select a trap to see its full JSON.
+- **Devices:** every source that has sent traps, with a count and its last trap.
+- **Rejected:** every refused or unreadable packet with the exact reason, e.g. a wrong community, an unknown v3 user, a failed authentication or decryption, or a stale trap.
+- **Send test trap:** sends v1, v2c or v3 traps and informs to the gateway or any other host. You can pick a configured v3 user or enter custom credentials, which is handy for testing a device's settings.
+- **Configuration:** edit `config.yaml`, then use *Check*, *Save* or *Save and restart*. An invalid file is never saved, and the previous version is kept as `config.yaml.bak`.
+- **Log:** the gateway's own log messages.
+
 ## SNMPv3
 
 Add a USM user for each user name your devices send with:
@@ -147,7 +169,7 @@ snmp:
 python -m unittest discover -s tests -v
 ```
 
-The 27 tests cover:
+The 32 tests cover:
 
 - decoding a hand-encoded v1 packet and every SNMP value type
 - INFORM acknowledgements, community filtering and garbled packets
@@ -155,6 +177,7 @@ The 27 tests cover:
 - for SNMPv3: rejection of wrong keys, tampered messages, unknown users and the wrong security level
 - for SNMPv3: replay protection, engine discovery, authenticated inform responses, and time-window Reports
 - live UDP end-to-end runs with a fake publisher
+- the desktop window's controller: start, stop and restart, live trap and rejection events, test traps, config checks with backup, and the port-in-use error
 
 They don't need asyncua.
 
@@ -173,6 +196,9 @@ snmp2opcua/
   opcua_client.py  client mode (asyncua Client)
   gateway.py       wiring, queue, shutdown
   sendtrap.py      test trap/inform sender
+  gui.py           desktop window (Tkinter)
+  gui_controller.py  runs the gateway in a thread for the window; no Tk code, so it's testable
 config.yaml        example configuration
 examples/watch_traps.py   OPC UA subscriber for testing
+run_gui.pyw        double-click launcher for the desktop window
 ```
