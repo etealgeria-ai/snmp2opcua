@@ -8,8 +8,9 @@ loaded directly:
     Eng Units, Description, Negate Value
 
 Only Tag Name and Address are required. Columns may be in any order. Comma or semicolon
-delimiters are detected. Rows with addresses that aren't trap or EVENTS_ addresses
-(polled OIDs, for example) are skipped and reported. Tag names may contain dots for tag
+delimiters are detected. Trap (TRAP_V1/TRAP_V2C), EVENTS_ and numeric OID addresses (polled
+with SNMP GET; the device needs polling settings) are imported. Other addresses, such as
+MIB names, are skipped and reported. Tag names may contain dots for tag
 groups, e.g. "Traps.Port3Down".
 
     python -m snmp2opcua.tag_csv check tags.csv
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import io
 import sys
 from pathlib import Path
@@ -29,6 +31,7 @@ COLUMNS = ["Tag Name", "Address", "Data Type", "Respect Data Type", "Client Acce
            "Raw Low", "Raw High", "Scaled Low", "Scaled High", "Scaled Data Type", "Clamp Low", "Clamp High",
            "Eng Units", "Description", "Negate Value"]
 TRAP_PREFIXES = ("TRAP_V1:", "TRAP_V2C:", "EVENTS_")
+_NUMERIC_OID = re.compile(r"^\.?[0-9]+(\.[0-9]+)+$")
 
 
 class TagCsvError(ValueError):
@@ -72,8 +75,8 @@ def read_tags(source: str | Path | io.TextIOBase, device: str = "") -> tuple[lis
         if not name or not address:
             problems.append(f"Row {n}: Tag Name and Address are required")
             continue
-        if not address.upper().startswith(TRAP_PREFIXES):
-            skipped.append(f"Row {n}: {name} ({address}) is not a trap address, skipped")
+        if not (address.upper().startswith(TRAP_PREFIXES) or _NUMERIC_OID.match(address)):
+            skipped.append(f"Row {n}: {name} ({address}) is not a trap, EVENTS_ or numeric OID address, skipped")
             continue
         if name in names:
             problems.append(f"Row {n}: the tag {name} has already been added")

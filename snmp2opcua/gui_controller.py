@@ -203,6 +203,8 @@ class GatewayController:
             self.events.put(("trap", d))
         elif kind == "tags":
             self.events.put(("tags", list(payload)))
+        elif kind == "radios":
+            self.events.put(("radios", dict(payload)))
         else:
             payload = dict(payload, time=datetime.now().strftime("%H:%M:%S"))
             self.events.put((kind, payload))
@@ -259,6 +261,14 @@ class GatewayController:
                     "last_trap": st.last_trap.astimezone().strftime("%H:%M:%S") if st.last_trap else None}
                     for d in gw.engine.devices for st in [gw.engine.state[d.path]]],
                 "unmatched": dict(gw.engine.unmatched),
+                "polling": [{
+                    "path": p.dev.path, "host": p.dev.host, "port": p.cfg.port, "version": p.cfg.version,
+                    "rate_ms": p.cfg.scan_rate_ms, "orbit": p.cfg.ge_orbit_remotes, "tags": len(p.tags),
+                    "polls": p.stats.polls, "failures": p.stats.failures,
+                    "consecutive_failures": p.stats.consecutive_failures, "error": p.stats.last_error,
+                    "duration_ms": p.stats.duration_ms, "timeouts": p.client.timeouts,
+                    "last_ok": p.stats.last_ok.astimezone().strftime("%H:%M:%S") if p.stats.last_ok else None,
+                    "rssi_warning": p.cfg.rssi_warning_dbm, "radios": p.radios()} for p in gw.pollers],
             }
         try:
             return asyncio.run_coroutine_threadsafe(collect(), loop).result(timeout=3)

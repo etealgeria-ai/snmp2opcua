@@ -18,6 +18,8 @@ from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .snmp_driver import PollAddress
+
 STATUS_LABEL = {"problem": "Problem", "warn": "Warning", "ok": "OK", "info": "Info"}
 STATUS_ORDER = ["problem", "warn", "ok", "info"]
 
@@ -311,6 +313,59 @@ def run_diagnostics(ctl, tk_version: str | None = None) -> list[Check]:
             add(sec, f"Kepware SNMP Agent at {ip}", "info",
                 f"agent sub-identifier {agent if agent is not None else '?'}, last trap {when}"
                 + (f": {descr}" if descr else ""))
+
+    # ---------------------------------------------------------------- polling
+    sec = "Polling"
+    if cfg is not None:
+        pollers = [d for d in cfg.get("_devices") or [] if d.poll is not None and d.poll.enabled]
+        live_polls = {p["path"]: p for p in snap.get("polling") or []}
+        for dev in pollers:
+            pc = dev.poll
+            assert pc is not None
+            n_tags = sum(1 for t in dev.tags if isinstance(t.address, PollAddress))
+            parts = ["GE Orbit remotes"] if pc.ge_orbit_remotes else []
+            if n_tags:
+                parts.append(_n(n_tags, "polled tag"))
+            what = " and ".join(parts) or "nothing to poll"
+            where = f"{dev.host}:{pc.port}, SNMP v{pc.version}, every {pc.scan_rate_ms / 1000:g} s, {what}"
+            lp = live_polls.get(dev.path)
+            name = f"Poll {dev.path}"
+            if not running or lp is None:
+                add(sec, name, "info", where)
+                continue
+            if lp["polls"] == 0:
+                add(sec, name, "info", f"{where}: first poll pending")
+            elif lp["consecutive_failures"]:
+                add(sec, name, "problem", f"{where}: failing ({lp['error']}); last good poll "
+                    f"{lp['last_ok'] or 'never'}",
+                    "Check the IP address and read community, that the master allows SNMP from this computer "
+                    "(SNMP access list), and that UDP 161 is open between them. Polled tags keep their last "
+                    "value with Bad quality meanwhile.")
+            else:
+                extra = f"; {lp['failures']} failed polls, {lp['timeouts']} timeouts so far" if lp["failures"] else ""
+                add(sec, name, "warn" if lp["failures"] else "ok",
+                    f"{where}: last poll {lp['last_ok']} took {lp['duration_ms']} ms{extra}",
+                    "Occasional timeouts: raise timeout_ms or retries, or check the link to the master."
+                    if lp["failures"] else "")
+            radios = lp["radios"]
+            if pc.ge_orbit_remotes and lp["polls"]:
+                offline = [r for r in radios if not r["online"]]
+                add(sec, f"Remotes of {dev.path}", "warn" if offline else ("ok" if radios else "info"),
+                    f"{len(radios) - len(offline)} online, {len(offline)} offline" if radios else
+                    "The master reports no connected remotes",
+                    ("Offline: " + ", ".join(f"{r['mac']} ({r['ip']}, last seen {r['last_seen']})" for r in offline))
+                    if offline else ("Check that the remotes are powered and associated with this master."
+                                     if not radios else ""))
+                weak = sorted((r for r in radios if r["online"] and r["weak"]), key=lambda r: r["rssi"])
+                if weak:
+                    add(sec, f"Weak signal on {dev.path}", "warn",
+                        ", ".join(f"{r['mac']} {r['rssi']} dBm" for r in weak),
+                        f"These remotes are below rssi_warning_dbm ({pc.rssi_warning_dbm} dBm). Check antennas, "
+                        "cabling, alignment and obstructions.")
+                if radios:
+                    rs = [r["rssi"] for r in radios if r["online"] and r["rssi"] is not None]
+                    if rs:
+                        add(sec, f"RSSI range on {dev.path}", "info", f"strongest {max(rs)} dBm, weakest {min(rs)} dBm")
 
     # ---------------------------------------------------------------- SNMPv3
     sec = "SNMPv3"

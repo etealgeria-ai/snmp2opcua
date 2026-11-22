@@ -51,13 +51,18 @@ AUTO_TABLE_FIELDS = 20
 MAX_TABLE_INDEX = 6 + 2 * 64
 
 # Kepware data type name -> OPC UA built-in type
-OPCUA_TYPES = {"Boolean": "Boolean", "String": "String", "Long": "Int32", "DWord": "UInt32"}
+OPCUA_TYPES = {"Boolean": "Boolean", "String": "String", "Long": "Int32", "DWord": "UInt32",
+               "Float": "Float", "Double": "Double", "Date": "DateTime"}
 DATA_TYPES = set(OPCUA_TYPES)
+POLL_TYPES = ("Boolean", "Long", "DWord", "Float", "Double", "String")
+INITIAL = {"Boolean": False, "String": "", "Long": 0, "DWord": 0, "Float": 0.0, "Double": 0.0, "Date": None}
+MIN_RATE_MS, MAX_RATE_MS = 10, 49 * 24 * 3600 * 1000
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _\-]*$")
 _TRAP_ADDR = re.compile(r"^(TRAP_V1|TRAP_V2C):\.?([0-9]+(?:\.[0-9]+)+)((?::[A-Za-z][0-9]+)*)(?:\[([0-9]+)\])?$",
                         re.IGNORECASE)
 _EVENTS_ADDR = re.compile(r"^EVENTS_(?:(COUNT)|([0-9]{3})(?:_(FLDCNT|[0-9]{3}))?)$", re.IGNORECASE)
+_OID_ADDR = re.compile(r"^\.?([0-9]+(?:\.[0-9]+)+)$")
 
 
 class DriverConfigError(ValueError):
@@ -129,8 +134,25 @@ class EventsAddress:
         return s
 
 
-def parse_address(text: str) -> TrapAddress | EventsAddress:
+@dataclass(frozen=True)
+class PollAddress:
+    """A polled OID (SNMP GET), like the driver's plain OID addresses."""
+    oid: str
+    default_type: str = "String"
+    writable: bool = False
+
+    def text(self) -> str:
+        return f".{self.oid}"
+
+
+def parse_address(text: str) -> TrapAddress | EventsAddress | PollAddress:
     s = (text or "").strip()
+    m = _OID_ADDR.match(s)
+    if m:
+        oid = m.group(1)
+        if any(int(a) > 4294967295 for a in oid.split(".")):
+            raise AddressError(f"Invalid address '{text}': OID sub-identifiers must be within 0 to 4294967295")
+        return PollAddress(oid)
     m = _EVENTS_ADDR.match(s)
     if m:
         if m.group(1):
@@ -199,7 +221,7 @@ def parse_address(text: str) -> TrapAddress | EventsAddress:
 @dataclass
 class TagDef:
     name: str                 # may contain dots for tag groups: "Group1.Tag1"
-    address: TrapAddress | EventsAddress
+    address: TrapAddress | EventsAddress | PollAddress
     data_type: str
     description: str = ""
     auto: bool = False
@@ -207,6 +229,21 @@ class TagDef:
     @property
     def writable(self) -> bool:
         return self.address.writable
+
+
+@dataclass
+class PollConfig:
+    """SNMP polling of the device (GET / table walks)."""
+    enabled: bool = True
+    community: str = "public"
+    version: str = "2c"               # "1" or "2c"
+    port: int = 161
+    scan_rate_ms: int = 10000
+    timeout_ms: int = 2000
+    retries: int = 1
+    max_repetitions: int = 20
+    ge_orbit_remotes: bool = False    # read RSSI/IP of remote radios from a GE MDS Orbit master
+    rssi_warning_dbm: int | None = None
 
 
 @dataclass
@@ -223,6 +260,7 @@ class DeviceDef:
     number_of_fields: int = 10
     extended_ascii: bool = False
     v3_user: UsmUser | None = None
+    poll: PollConfig | None = None
     tags: list[TagDef] = field(default_factory=list)
 
     @property
@@ -270,7 +308,11 @@ def make_tag(name: str, address: str, data_type: str | None = None, description:
           "default": "Default"}.get(dt.lower(), dt)
     if dt == "Default":
         dt = addr.default_type
-    if dt not in (addr.default_type, "String"):
+    if isinstance(addr, PollAddress):
+        if dt not in POLL_TYPES:
+            raise DriverConfigError(f"Tag {name}{where}: data type {dt} is not supported for polled OIDs; "
+                                    f"use one of {', '.join(POLL_TYPES)}")
+    elif dt not in (addr.default_type, "String"):
         raise DriverConfigError(f"Tag {name}{where}: data type {dt} is not valid for address {addr.text()}; "
                                 f"use Default ({addr.default_type}) or String")
     return TagDef(name, addr, dt, description or "", auto)
@@ -348,6 +390,9 @@ def build_devices(channels_cfg: list, base_dir=None, csv_loader=None, default_po
                 except ValueError as exc:
                     raise DriverConfigError(f"{where} SNMP V3 Security: {exc}") from None
 
+            if d.get("polling") is not None:
+                dev.poll = _poll_config(d["polling"], dev, where)
+
             tags: list[TagDef] = []
             names: set[str] = set()
             sources = list(d.get("tags") or [])
@@ -363,6 +408,9 @@ def build_devices(channels_cfg: list, base_dir=None, csv_loader=None, default_po
                     raise DriverConfigError(f"The tag {ch}.{name}.{tag.name} has already been added")
                 if isinstance(tag.address, EventsAddress):
                     _check_events_range(tag, dev)
+                if isinstance(tag.address, PollAddress) and dev.poll is None:
+                    raise DriverConfigError(f"Tag {ch}.{name}.{tag.name} polls OID {tag.address.text()}, but the "
+                                            f"device has no polling settings. Add polling: {{community: ...}}.")
                 names.add(tag.name)
                 tags.append(tag)
             generated = events_tags(dev) + (auto_tags(dev) if d.get("auto_create_tags", True) else [])
@@ -376,6 +424,39 @@ def build_devices(channels_cfg: list, base_dir=None, csv_loader=None, default_po
             dev.tags = tags
             devices.append(dev)
     return devices
+
+
+def _rate(value, what: str, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        raise DriverConfigError(f"{what}: give the rate in milliseconds") from None
+    if not MIN_RATE_MS <= v <= MAX_RATE_MS:
+        raise DriverConfigError(f"{what}: the rate must be within the range of 10 milliseconds and 49 days.")
+    return v
+
+
+def _poll_config(p: dict, dev: DeviceDef, where: str) -> PollConfig:
+    if not isinstance(p, dict):
+        raise DriverConfigError(f"{where}: polling must be a mapping, e.g. {{community: public}}")
+    given = p.get("snmp_version", dev.snmp_version if dev.snmp_version in ("1", "2c") else None)
+    version = str(given or "").lower().lstrip("v")
+    if version not in ("1", "2c"):
+        raise DriverConfigError(f"{where}: polling supports SNMP version 1 or 2c; set polling.snmp_version")
+    warn = p.get("rssi_warning_dbm")
+    return PollConfig(
+        enabled=bool(p.get("enabled", True)),
+        community=str(p.get("community", "public")),
+        version=version,
+        port=_int(p.get("port"), 1, 65535, f"{where}: polling port", 161),
+        scan_rate_ms=_rate(p.get("scan_rate_ms"), f"{where}: polling scan_rate_ms", 10000),
+        timeout_ms=_int(p.get("timeout_ms"), 50, 60000, f"{where}: polling timeout_ms", 2000),
+        retries=_int(p.get("retries"), 0, 10, f"{where}: polling retries", 1),
+        max_repetitions=_int(p.get("max_repetitions"), 1, 200, f"{where}: polling max_repetitions", 20),
+        ge_orbit_remotes=bool(p.get("ge_orbit_remotes", False)),
+        rssi_warning_dbm=None if warn is None else _int(warn, -200, 0, f"{where}: rssi_warning_dbm", -95))
 
 
 def _check_events_range(tag: TagDef, dev: DeviceDef) -> None:
@@ -455,7 +536,12 @@ class TrapTagEngine:
 
     @staticmethod
     def _initial(tag: TagDef):
-        return {"Boolean": False, "String": "", "Long": 0, "DWord": 0}[tag.data_type]
+        return INITIAL[tag.data_type]
+
+    def set_values(self, updates: list[Update]) -> None:
+        """Record values that came from polling (paths may be new, e.g. a newly seen remote radio)."""
+        for u in updates:
+            self.values[u.path] = (u.value, u.good, datetime.now())
 
     def all_tags(self) -> list[tuple[DeviceDef, TagDef]]:
         return [(d, t) for d in self.devices for t in d.tags]

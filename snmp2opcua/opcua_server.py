@@ -41,6 +41,9 @@ class OpcUaServerPublisher:
         self.devices_cfg = devices or []
         self.tag_nodes: dict[str, tuple[object, object]] = {}   # path -> (node, variant type)
         self.writable_paths: set[str] = set()
+        self.extra_tags: list[tuple[str, str]] = []             # (path, data type), e.g. polling status
+        self._folders: dict[str, object] = {}
+        self._objects = None
         self.engine = None                                      # set by the gateway (for client resets)
         self._reset_sub = None
         self.server: Server | None = None
@@ -134,34 +137,40 @@ class OpcUaServerPublisher:
         await self._watch_resets()
         log.info("OPC UA server running at %s (namespace index %d)", cfg["endpoint"], self.idx)
 
+    async def _folder(self, path: str):
+        if path in self._folders:
+            return self._folders[path]
+        parent_path, _, name = path.rpartition(".")
+        parent = await self._folder(parent_path) if parent_path else self._objects
+        node = await parent.add_folder(self._nid(path), self._qn(name))
+        self._folders[path] = node
+        return node
+
+    async def _add_tag(self, path: str, data_type: str, writable: bool = False):
+        parent_path, _, name = path.rpartition(".")
+        parent = await self._folder(parent_path)
+        vtype = getattr(ua.VariantType, OPCUA_TYPES[data_type])
+        initial = {"Boolean": False, "String": "", "Int32": 0, "UInt32": 0, "Float": 0.0, "Double": 0.0,
+                   "DateTime": datetime(1970, 1, 1, tzinfo=timezone.utc)}[OPCUA_TYPES[data_type]]
+        node = await parent.add_variable(self._nid(path), self._qn(name), initial, varianttype=vtype)
+        if writable:
+            await node.set_writable()
+            self.writable_paths.add(path)
+        self.tag_nodes[path] = (node, vtype)
+        return node, vtype
+
     async def _build_driver_tree(self, objects) -> None:
         """Channel -> Device -> Tag, with Kepware-style string NodeIds ns=<idx>;s=Channel.Device.Tag."""
-        folders: dict[str, object] = {}
-
-        async def folder(path: str):
-            if path in folders:
-                return folders[path]
-            parent_path, _, name = path.rpartition(".")
-            parent = await folder(parent_path) if parent_path else objects
-            node = await parent.add_folder(self._nid(path), self._qn(name))
-            folders[path] = node
-            return node
-
+        self._objects = objects
         for dev in self.devices_cfg:
-            await folder(dev.path)
+            await self._folder(dev.path)
             for tag in dev.tags:
-                path = dev.tag_path(tag)
-                parent_path, _, name = path.rpartition(".")
-                parent = await folder(parent_path)
-                vtype = getattr(ua.VariantType, OPCUA_TYPES[tag.data_type])
-                initial = {"Boolean": False, "String": "", "Int32": 0, "UInt32": 0}[OPCUA_TYPES[tag.data_type]]
-                node = await parent.add_variable(self._nid(path), self._qn(name), initial, varianttype=vtype)
-                if tag.writable:
-                    await node.set_writable()
-                    self.writable_paths.add(path)
-                self.tag_nodes[path] = (node, vtype)
+                await self._add_tag(dev.tag_path(tag), tag.data_type, tag.writable)
+        for path, data_type in self.extra_tags:
+            if path not in self.tag_nodes:
+                await self._add_tag(path, data_type)
         if self.tag_nodes:
-            log.info("Created %d trap tags for %d devices", len(self.tag_nodes), len(self.devices_cfg))
+            log.info("Created %d tags for %d devices", len(self.tag_nodes), len(self.devices_cfg))
 
     async def _watch_resets(self) -> None:
         """Notice when an OPC UA client writes 0 to a trap tag or EVENTS_COUNT, to keep the engine in step."""
@@ -183,11 +192,21 @@ class OpcUaServerPublisher:
             log.debug("Could not watch trap tag resets", exc_info=True)
 
     async def _apply_tag_updates(self, trap: Trap) -> None:
-        for u in trap.tag_updates:
+        await self.apply_updates(trap.tag_updates)
+
+    async def apply_updates(self, updates) -> None:
+        """Write tag updates; tags first seen now (e.g. a new remote radio) get their node created."""
+        if self.server is None:
+            return
+        for u in updates:
             entry = self.tag_nodes.get(u.path)
             if entry is None:
-                continue
+                if u.value is None:
+                    continue
+                entry = await self._add_tag(u.path, u.data_type)
             node, vtype = entry
+            if u.value is None:
+                continue
             if u.op == "inc":
                 try:
                     current = int(await node.read_value() or 0)

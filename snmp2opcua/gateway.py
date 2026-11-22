@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from .config import listen_endpoints
 from .oids import OidResolver
+from .poller import DevicePoller
 from .receiver import ListenerError, Stats, TrapProtocol, start_listener
 from .severity import SeverityMap
 from .snmp_driver import TrapTagEngine
@@ -41,6 +42,10 @@ class Gateway:
         self.engine = TrapTagEngine(cfg.get("_devices") or [])
         if hasattr(self.publisher, "engine"):
             self.publisher.engine = self.engine     # lets client resets (writing 0) reach the engine
+        self.pollers = [DevicePoller(d, self.resolver) for d in cfg.get("_devices") or []
+                        if d.poll is not None and d.poll.enabled]
+        if hasattr(self.publisher, "extra_tags"):
+            self.publisher.extra_tags = [t for p in self.pollers for t in p.static_tags()]
         self.monitor: Callable[[str, Any], None] | None = None   # set by the desktop UI
         self._stop = asyncio.Event()
 
@@ -65,6 +70,16 @@ class Gateway:
             finally:
                 self.queue.task_done()
             await self._status()
+
+    async def _on_poll(self, poller: DevicePoller, updates: list) -> None:
+        self.engine.set_values(updates)
+        self._notify("tags", [(u.path, u.value, u.good, u.data_type) for u in updates])
+        if poller.cfg.ge_orbit_remotes:
+            self._notify("radios", {"master": poller.dev.path, "rows": poller.radios(),
+                                    "ok": poller.stats.consecutive_failures == 0, "error": poller.stats.last_error})
+        apply = getattr(self.publisher, "apply_updates", None)
+        if apply is not None:
+            await apply(updates)
 
     def _notify(self, kind: str, payload) -> None:
         """Tell the desktop UI; a failing UI callback must never cost a trap."""
@@ -118,6 +133,13 @@ class Gateway:
                 if st.error:
                     log.warning(st.error)
             tasks = [asyncio.create_task(self._consume()), asyncio.create_task(self._status_loop())]
+            for p in self.pollers:
+                tasks.append(asyncio.create_task(p.run(self._on_poll, self._stop)))
+                log.info("Polling %s at %s:%d every %g s%s", p.dev.path, p.dev.host, p.cfg.port,
+                         p.cfg.scan_rate_ms / 1000, " (GE Orbit remote RSSI)" if p.cfg.ge_orbit_remotes else "")
+            if self.pollers and not hasattr(self.publisher, "apply_updates"):
+                log.warning("Polled values are published in OPC UA server mode only; client mode shows them in "
+                            "the window and diagnostics")
             if self.monitor is not None:
                 self._notify("started", {
                     "listen": [f"{proto} {host}:{port}" for host, port, proto in endpoints],
@@ -136,4 +158,6 @@ class Gateway:
             for t in tasks:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            for p in self.pollers:
+                p.close()
             await self.publisher.stop()

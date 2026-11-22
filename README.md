@@ -21,6 +21,7 @@ It has two modes:
   - a per-device trap events queue (`EVENTS_COUNT`, `EVENTS_001…`) and auto-created coldStart/warmStart/linkUp/linkDown tags
   - KEPServerEX tag CSV import/export
 - **Traps from Kepware SNMP Agents**: their `lastTrapDescr` becomes the trap's description, and the agent's system objects get readable names
+- **SNMP polling**: reads the RSSI and IP of every GE MDS Orbit remote radio from the master station, plus any OIDs you list, and publishes them as OPC UA tags. A Radios view in the window flags weak and offline remotes
 - Community allow-list (v1/v2c), USM users (v3), an "accept packets from all hosts" option with a host list, a setting to accept only some SNMP versions (e.g. v3 only), several network interfaces/ports, and UDP or TCP trap listeners
 - Friendly OID names: common MIBs are built in (IF-MIB, SNMPv2-MIB, UPS-MIB, ...), and you can add your own in the config
 - OPC UA event severity is mapped per trap name or OID prefix
@@ -126,6 +127,9 @@ On Windows you can also double-click `run_gui.pyw`, which uses the `config.yaml`
   - *Export tags CSV…* writes the selected device's tags in KEPServerEX's CSV layout.
   - *Import tags CSV…* validates a CSV and saves it as the device's `tags_csv` file.
 - **Sources:** every address that has sent traps, with a count and its last trap.
+- **Radios:** the remote radios of each GE MDS Orbit master: MAC, IP, RSSI, IfIndex, status and last seen, weakest signal first.
+  - Remotes below `rssi_warning_dbm` are tinted amber and labelled "weak signal". Offline remotes are tinted red and labelled.
+  - *Copy as report* gives the same table as the original pysnmp script.
 - **Rejected:** every refused or unreadable packet with the exact reason, e.g. a wrong community, an unknown v3 user, a failed authentication or decryption, or a stale trap.
 - **Diagnostics:** health checks that run when you open the tab or press *Run checks*. Each result is marked Problem, Warning, OK or Info, with a "How to fix" note where needed. *Copy report* and *Save report…* produce a plain-text report for a ticket or email, and it never contains keys or passwords. The checks cover:
   - **Configuration:** whether it loads, the SNMP versions accepted, and the v3 users
@@ -198,6 +202,55 @@ python -m snmp2opcua.tag_csv export -c config.yaml --device Channel1.Switch1 -o 
 
 Traps from addresses that aren't configured devices are still published under `Gateway/LastTrap`, as events and in the window. Diagnostics lists them so you can add devices for them.
 
+## Polling: RSSI from GE MDS Orbit radios
+
+The gateway can poll devices over SNMP as well as receive their traps. The main use is reading signal strength from a **GE MDS Orbit master station** (for example the LN4 module in an Orbit MCR) for every remote radio connected to it.
+
+The master lists its remotes in the table `1.3.6.1.4.1.4130.10.2.5.1.2.2.1`. The row index is `<ifIndex>.<6 MAC octets>`, column `.2` is the remote's IP and column `.6` is its RSSI in dBm. These are the same table, columns and index parsing as the original pysnmp script. The gateway reads them with its own SNMP code (GETBULK for v2c, GETNEXT for v1), so pysnmp isn't needed. That matters because pysnmp 7 removed the synchronous `nextCmd` the script used.
+
+```yaml
+channels:
+  - name: Radios
+    devices:
+      - name: Master_LN4
+        ip: 192.168.1.10
+        auto_create_tags: false
+        polling:
+          community: public
+          snmp_version: 2c
+          scan_rate_ms: 10000
+          ge_orbit_remotes: true
+          rssi_warning_dbm: -95
+        tags:
+          - {name: SysName, address: ".1.3.6.1.2.1.1.5.0"}     # any numeric OID is polled with GET
+```
+
+**OPC UA tags**, refreshed every scan:
+
+| Tag | Type | Meaning |
+|---|---|---|
+| `Radios.Master_LN4.Remotes.<MAC>.RSSI` | Int32 | RSSI in dBm, e.g. `ns=2;s=Radios.Master_LN4.Remotes.00063D123456.RSSI` |
+| `….Remotes.<MAC>.IP` / `.MAC` / `.IfIndex` | String / String / Int32 | The remote's address and row index |
+| `….Remotes.<MAC>.Online` / `.LastSeen` | Boolean / DateTime | Whether it was in the last poll, and when it was last seen |
+| `….Remotes.Count` / `.OnlineCount` | UInt32 | Remotes ever seen / in the last poll |
+| `…._Polling.OK` / `.Error` / `.LastPoll` / `.DurationMs` / `.Failures` | | Poll status |
+
+How the tags behave:
+- A remote's folder is created the first time the master reports it.
+- A remote that drops out of the table keeps its last RSSI and gets `Online = 0`.
+- If the master stops answering, every polled tag keeps its last value with Bad quality and `_Polling.OK = 0`. The Radios view and Diagnostics then show the error with likely causes (community, the master's SNMP access list, UDP 161).
+
+The settings are `community`, `port`, `snmp_version` (1 or 2c), `scan_rate_ms` (10 ms to 49 days), `timeout_ms`, `retries`, `max_repetitions` (the gateway halves it automatically if the master answers `tooBig`), `ge_orbit_remotes` and `rssi_warning_dbm`. Polled values are published in OPC UA server mode. In client mode they appear in the window and Diagnostics only.
+
+**The same report on the command line:**
+
+```bash
+python -m snmp2opcua.ge_orbit --ip 192.168.1.10 --community public
+REMOTE_MAC         REMOTE_IP        RSSI (dBm)   IF_INDEX
+----------------------------------------------------------
+00:06:3D:12:34:56  10.10.1.21       -72          3
+```
+
 ## Traps from Kepware SNMP Agents
 
 KEPServerEX's SNMP Agent Plug-In puts a trap's description into its `lastTrapDescr` system object (`1.3.6.1.4.1.30144.12.<agent>.1.7.0`) and sends it with the trap. The gateway turns that into the trap's **description**. It appears in the JSON, the event message, the window's Description column and the log. The agent's other system objects (sysDescr…sysLocation under `1.3.6.1.4.1.30144.12.<agent>.1.<n>.0`) get readable names, and the agent's sub-identifier is recorded. To get tags for a Kepware trap, copy the V2c OID (or the V1 Enterprise OID and Specific Trap Type) from the trap's properties in KEPServerEX into a `TRAP_V2C:` or `TRAP_V1:…:G6:Sx` address.
@@ -250,7 +303,7 @@ snmp:
 python -m unittest discover -s tests -v
 ```
 
-The 64 tests cover:
+The 75 tests cover:
 
 - decoding a hand-encoded v1 packet and every SNMP value type
 - INFORM acknowledgements, community filtering and garbled packets
@@ -268,6 +321,11 @@ The 64 tests cover:
   - the events queue and resets, and Extended ASCII
 - Kepware agent traps, KEPServerEX tag CSV import/export, the new config checks, and listener error wording
 - end-to-end: devices on UDP and on TCP, including a v3 trap split across TCP packets
+- polling against a simulated GE Orbit master:
+  - GET, GETNEXT and GETBULK walks, with `tooBig` back-off, timeouts and retries
+  - the remote-table index and IP parsing, and a report identical to the original script's
+  - remotes going offline, the master going down, value conversion and config checks
+  - an end-to-end gateway run
 
 They don't need asyncua.
 
@@ -280,6 +338,9 @@ snmp2opcua/
   snmp_driver.py   KEPServerEX-style devices and trap tags: addresses, events queue, table fields
   tag_csv.py       KEPServerEX tag CSV import/export
   kepware.py       traps from Kepware SNMP Agents (lastTrapDescr, system objects)
+  snmp_client.py   SNMP v1/v2c polling client (GET, GETNEXT, GETBULK, walk)
+  poller.py        per-device polling: OID tags, GE Orbit remotes, poll status tags
+  ge_orbit.py      GE MDS Orbit remote table (RSSI/IP per remote) + command-line report
   snmpv3.py        SNMPv3 messages: auth, timeliness, decrypt, discovery Reports, inform Responses
   usm.py           USM crypto: key localization, HMAC, DES/AES
   receiver.py      UDP and TCP trap listeners, filtering, stats

@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - reported in main()
 from .diagnostics import STATUS_LABEL, Check, report_text, run_diagnostics, summarize
 from .gui_controller import GatewayController, TrapRequest, parse_varbind_lines
 from .snmp_driver import DeviceDef, EventsAddress
+from .ge_orbit import Remote, format_report
 from .tag_csv import TagCsvError, read_tags, write_tags
 from .usm import AUTH_PROTOCOLS, PRIV_PROTOCOLS, UsmUser
 
@@ -87,6 +88,8 @@ class GatewayApp:
         self.diag_by_iid: dict[str, Check] = {}
         self.tag_values: dict[str, tuple[object, bool, str]] = {}   # path -> (value, good, time)
         self.tag_devices: list[DeviceDef] = []
+        self.dynamic_types: dict[str, str] = {}          # polled tags not in the config (e.g. remote radios)
+        self.radios: dict[str, dict] = {}                 # master path -> last "radios" payload
 
         self._setup_style()
         self._build()
@@ -198,6 +201,7 @@ class GatewayApp:
         self.nb.pack(side="top", fill="both", expand=True, padx=12)
         self.tab_traps = self._build_traps_tab()
         self.tab_tags = self._build_tags_tab()
+        self.tab_radios = self._build_radios_tab()
         self.tab_devices = self._build_devices_tab()
         self.tab_rejected = self._build_rejected_tab()
         self.tab_diag = self._build_diag_tab()
@@ -332,6 +336,10 @@ class GatewayApp:
     def _fmt_value(value) -> str:
         if isinstance(value, bool):
             return "1" if value else "0"
+        if isinstance(value, datetime):
+            return value.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(value, float):
+            return f"{value:g}"
         return "" if value is None else str(value)
 
     def _rebuild_tag_tree(self) -> None:
@@ -355,11 +363,18 @@ class GatewayApp:
                 path = dev.tag_path(tag)
                 if needle and needle not in path.lower() and needle not in tag.address.text().lower():
                     continue
-                initial = {"Boolean": False, "String": "", "Long": 0, "DWord": 0}[tag.data_type]
+                initial = {"Boolean": False, "String": "", "Long": 0, "DWord": 0, "Float": 0.0, "Double": 0.0,
+                           "Date": ""}[tag.data_type]
                 value, good, when = self.tag_values.get(path, (initial, True, ""))
                 tree.insert(dev_iid, "end", iid=f"tag:{path}", text=tag.name, tags=() if good else ("bad",),
                             values=(tag.address.text(), tag.data_type, self._fmt_value(value),
                                     "Good" if good else "Bad", when))
+        for path, data_type in list(self.dynamic_types.items()):
+            if not needle or needle in path.lower():
+                if not tree.exists(f"tag:{path}") and self._ensure_dynamic_row(path, data_type):
+                    value, good, when = self.tag_values.get(path, ("", True, ""))
+                    tree.item(f"tag:{path}", values=("(polled)", data_type, self._fmt_value(value),
+                                                     "Good" if good else "Bad", when), tags=() if good else ("bad",))
         if self.tag_devices:
             self.empty_tags.place_forget()
         else:
@@ -367,11 +382,33 @@ class GatewayApp:
         n = sum(len(d.tags) for d in self.tag_devices)
         self.nb.tab(self.tab_tags, text=f"Tags ({n:,})" if n else "Tags")
 
+    def _ensure_dynamic_row(self, path: str, data_type: str) -> bool:
+        """Add a row for a polled tag that isn't in the config (e.g. a newly seen remote radio)."""
+        dev = next((d for d in self.tag_devices if path.startswith(d.path + ".")), None)
+        if dev is None or not self.tag_tree.exists(f"dev:{dev.path}"):
+            return False
+        self.dynamic_types[path] = data_type
+        parent = f"dev:{dev.path}"
+        segments = path[len(dev.path) + 1:].split(".")
+        prefix = dev.path
+        for seg in segments[:-1]:
+            prefix += "." + seg
+            gid = f"grp:{prefix}"
+            if not self.tag_tree.exists(gid):
+                self.tag_tree.insert(parent, "end", iid=gid, text=seg, open=not prefix.endswith(".Remotes") and
+                                     ".Remotes." not in prefix, values=("", "", "", "", ""))
+            parent = gid
+        self.tag_tree.insert(parent, "end", iid=f"tag:{path}", text=segments[-1],
+                             values=("(polled)", data_type, "", "", ""))
+        return True
+
     def _on_tags(self, updates: list) -> None:
         now = datetime.now().strftime("%H:%M:%S")
-        for path, value, good in updates:
+        for path, value, good, *rest in updates:
             self.tag_values[path] = (value, good, now)
             iid = f"tag:{path}"
+            if not self.tag_tree.exists(iid) and rest:
+                self._ensure_dynamic_row(path, rest[0])
             if self.tag_tree.exists(iid):
                 row = self.tag_tree.item(iid)["values"]
                 self.tag_tree.item(iid, values=(row[0], row[1], self._fmt_value(value), "Good" if good else "Bad",
@@ -456,6 +493,72 @@ class GatewayApp:
         note = f" {len(skipped)} rows without trap addresses were skipped." if skipped else ""
         self.status_line.configure(text=f"Imported {len(tags)} tags into {dest.name} for {dev.path}.{note} "
                                         f"Use Save and restart (Configuration tab) to apply.")
+
+    # ------------------------------------------------------------------ radios tab
+    def _build_radios_tab(self) -> ttk.Frame:
+        tab = ttk.Frame(self.nb, padding=(0, 10, 0, 0))
+        self.nb.add(tab, text="Radios")
+        bar = ttk.Frame(tab)
+        bar.pack(side="top", fill="x", pady=(0, 8))
+        self.radio_summary = ttk.Label(bar, text="Remote radios reported by GE MDS Orbit master stations, "
+                                                 "weakest signal first.", style="Muted.TLabel")
+        self.radio_summary.pack(side="left")
+        ttk.Button(bar, text="Copy as report", command=self.copy_radio_report).pack(side="right")
+        box = ttk.Frame(tab)
+        box.pack(side="top", fill="both", expand=True)
+        self.radio_tree = self._make_tree(box, [
+            ("master", "Master station", 170, False), ("mac", "Remote MAC", 150, False),
+            ("ip", "Remote IP", 130, False), ("rssi", "RSSI (dBm)", 90, False), ("ifindex", "IfIndex", 70, False),
+            ("status", "Status", 180, True), ("seen", "Last seen", 90, False)])
+        self.radio_tree.tag_configure("offline", background=ALARM_TINT)
+        self.radio_tree.tag_configure("weak", background=WARN_TINT)
+        self.empty_radios = tk.Label(box, background=FIELD, foreground=MUTED, font=self.f_base, justify="center",
+                                     text="No radios yet.\nAdd polling with ge_orbit_remotes: true to the GE master "
+                                          "station's device in the Configuration tab (see the README).")
+        self.empty_radios.place(relx=0.5, rely=0.5, anchor="center")
+        return tab
+
+    def _on_radios(self, payload: dict) -> None:
+        self.radios[payload["master"]] = payload
+        tree = self.radio_tree
+        tree.delete(*tree.get_children())
+        rows = [r for p in self.radios.values() for r in p["rows"]]
+        rows.sort(key=lambda r: (r["master"], r["rssi"] if r["rssi"] is not None else 999))
+        for r in rows:
+            tag: tuple[str, ...]
+            if not r["poll_ok"]:
+                status, tag = "Unknown, master not answering", ("offline",)
+            elif not r["online"]:
+                status, tag = "Offline", ("offline",)
+            elif r["weak"]:
+                status, tag = "Online, weak signal", ("weak",)
+            else:
+                status, tag = "Online", ()
+            tree.insert("", "end", values=(r["master"], r["mac"], r["ip"], "N/A" if r["rssi"] is None else r["rssi"],
+                                           r["if_index"], status, r["last_seen"]), tags=tag)
+        if rows:
+            self.empty_radios.place_forget()
+        parts = []
+        for master, p in self.radios.items():
+            online = sum(r["online"] for r in p["rows"])
+            state = "last poll OK" if p["ok"] else f"polling failed: {p['error']}"
+            parts.append(f"{master}: {len(p['rows'])} remotes, {online} online, {state}")
+        failing = any(not p["ok"] for p in self.radios.values())
+        self.radio_summary.configure(text="; ".join(parts) + ".", style="Error.TLabel" if failing else "TLabel")
+        offline = sum(1 for r in rows if not r["online"] or not r["poll_ok"])
+        self.nb.tab(self.tab_radios, text=f"Radios ({len(rows)})" + (f" ⚠ {offline} offline" if offline else ""))
+
+    def copy_radio_report(self) -> None:
+        if not self.radios:
+            self.radio_summary.configure(text="No radios to copy yet.", style="Muted.TLabel")
+            return
+        text = []
+        for master, p in self.radios.items():
+            remotes = [Remote(r["mac"], r["if_index"], r["ip"], r["rssi"]) for r in p["rows"] if r["online"]]
+            text.append(f"{master}\n{format_report(remotes)}")
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n\n".join(text) + "\n")
+        self.status_line.configure(text="Radio report copied to the clipboard.")
 
     # ------------------------------------------------------------------ devices tab
     def _build_devices_tab(self) -> ttk.Frame:
@@ -849,6 +952,8 @@ class GatewayApp:
             self._on_diag_result(payload)
         elif kind == "tags":
             self._on_tags(payload)
+        elif kind == "radios":
+            self._on_radios(payload)
 
     def _tick(self) -> None:
         stats = self.ctl.stats()

@@ -60,6 +60,9 @@ class AddressTests(unittest.TestCase):
         self.assertEqual([parse_address(f"TRAP_V2C:.1.3.6.1.4.1.9.0.1[{i}]").default_type for i in range(1, 9)],
                          ["String", "String", "Long", "Long", "DWord", "Long", "String", "String"])
         self.assertEqual(parse_address("EVENTS_COUNT").default_type, "DWord")
+        polled = parse_address(".1.3.6.1.2.1.1.5.0")
+        self.assertEqual((type(polled).__name__, polled.oid, polled.text()),
+                         ("PollAddress", "1.3.6.1.2.1.1.5.0", ".1.3.6.1.2.1.1.5.0"))
         self.assertEqual(parse_address("EVENTS_004_FLDCNT").default_type, "Long")
 
     def test_rejections_explain_the_fix(self):
@@ -75,7 +78,7 @@ class AddressTests(unittest.TestCase):
             "TRAP_V2C:.1.3.6.1.4.1.4294967296": "4294967295",
             "TRAP_V2C:.1.3.6.1.4.1.9[0]": "table index",
             "EVENTS_000": "start at 001",
-            "1.3.6.1.2.1.1.5.0": "Invalid address",
+            "sysName.0": "Invalid address",
         }
         for text, needle in bad.items():
             with self.assertRaises(AddressError, msg=text) as ctx:
@@ -247,16 +250,18 @@ class TagCsvTests(unittest.TestCase):
         "Scaled Low;Scaled High;Scaled Data Type;Clamp Low;Clamp High;Eng Units;Description;Negate Value\r\n"
         "\"Traps.Port3Down\";\"TRAP_V2C:.1.3.6.1.6.3.1.1.5.3:P3\";Boolean;1;R/W;100;;;;;;;;;;\"Port 3 down\";\r\n"
         "\"Traps.Port3Down_Uptime\";\"TRAP_V2C:.1.3.6.1.6.3.1.1.5.3:P3[5]\";DWord;1;RO;100;;;;;;;;;;;\r\n"
-        "\"sysUpTime\";\"1.3.6.1.2.1.1.3.0\";DWord;1;RO;1000;;;;;;;;;;;\r\n")
+        "\"sysUpTime\";\"1.3.6.1.2.1.1.3.0\";DWord;1;RO;1000;;;;;;;;;;;\r\n"
+        "\"sysName\";\"sysName.0\";String;1;RO;1000;;;;;;;;;;;\r\n")
 
     def test_import_kepware_export(self):
         tags, skipped = read_tags(io.StringIO(self.KEPWARE_EXPORT.lstrip("﻿")))
         self.assertEqual([(t.name, t.address.text(), t.data_type) for t in tags],
                          [("Traps.Port3Down", "TRAP_V2C:.1.3.6.1.6.3.1.1.5.3:P3", "Boolean"),
-                          ("Traps.Port3Down_Uptime", "TRAP_V2C:.1.3.6.1.6.3.1.1.5.3:P3[5]", "DWord")])
+                          ("Traps.Port3Down_Uptime", "TRAP_V2C:.1.3.6.1.6.3.1.1.5.3:P3[5]", "DWord"),
+                          ("sysUpTime", ".1.3.6.1.2.1.1.3.0", "DWord")])     # polled OID
         self.assertEqual(tags[0].description, "Port 3 down")
         self.assertEqual(len(skipped), 1)
-        self.assertIn("not a trap address", skipped[0])
+        self.assertIn("sysName.0", skipped[0])
 
     def test_any_column_order_and_errors(self):
         text = "Description,Address,Tag Name\nd1,TRAP_V2C:.1.3.6.1.4.1.9.0.1,A\n,TRAP_V1:.1.3.6.1.4.1.9:G3,B\n,,C\n"
