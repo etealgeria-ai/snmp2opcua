@@ -239,6 +239,13 @@ class SnmpV3Engine:
     def engine_time(self) -> int:
         return int(time.monotonic() - self._start) & MAX_BOOTS
 
+    def remote_engines(self) -> list[dict]:
+        """Devices whose traps authenticated, for diagnostics (newest first)."""
+        now = time.monotonic()
+        rows = [{"engine_id": eid.hex(), "boots": b, "engine_time": t, "seen_ago": int(now - seen)}
+                for eid, (b, t, seen) in list(self._remote.items())]
+        return sorted(rows, key=lambda r: r["seen_ago"])
+
     # ------------------------------------------------------------------ replies
     def _report(self, h: V3Header, stat: str, request_id: int, user: UsmUser | None = None) -> bytes:
         self.counters[stat] += 1
@@ -249,6 +256,12 @@ class SnmpV3Engine:
         return build_message(msg_id=h.msg_id, engine_id=self.engine_id, boots=self.boots,
                              engine_time=self.engine_time(), user_name=h.user, scoped_pdu=scoped,
                              user=user, level=level)
+
+    def _reject_stale(self, h: V3Header):
+        self.counters["notInTimeWindows"] += 1
+        raise V3Rejected(
+            f"replayed or stale trap from engine {h.engine_id.hex()} (boots={h.boots}, time={h.engine_time}). "
+            "If this device resets engineBoots on reboot, set snmp.v3.replay_protection: false")
 
     def _refuse(self, stat: str, reason: str, data: bytes, h: V3Header, user: UsmUser | None = None):
         """Count a USM failure and raise V3Rejected, with a Report if the sender asked for one."""
@@ -335,12 +348,11 @@ class SnmpV3Engine:
                     # authenticated Report so the sender can trust our boots/time and resynchronize
                     self._refuse("notInTimeWindows", f"message from user {user_label!r} outside the time window",
                                  data, h, user)
-            elif self.replay_protection and not self._remote_time_ok(h.engine_id, h.boots, h.engine_time):
-                self.counters["notInTimeWindows"] += 1
-                raise V3Rejected(
-                    f"replayed or stale trap from engine {h.engine_id.hex()} (boots={h.boots}, time={h.engine_time}). "
-                    "If this device resets engineBoots on reboot, set snmp.v3.replay_protection: false")
-
+            elif not self._remote_time_ok(h.engine_id, h.boots, h.engine_time):
+                if not self.replay_protection:      # accepted anyway; remember the latest values
+                    self._remote[h.engine_id] = (h.boots, h.engine_time, time.monotonic())
+                else:
+                    self._reject_stale(h)
         if not level_ok:
             self._refuse("unsupportedSecLevels",
                          f"user {user_label!r} sent {h.level}, but is configured for {user.level}", data, h)

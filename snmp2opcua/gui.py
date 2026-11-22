@@ -16,6 +16,7 @@ import queue
 import sys
 import threading
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -26,6 +27,7 @@ try:
 except ImportError:  # pragma: no cover - reported in main()
     tk = None  # type: ignore[assignment]
 
+from .diagnostics import STATUS_LABEL, Check, report_text, run_diagnostics, summarize
 from .gui_controller import GatewayController, TrapRequest, parse_varbind_lines
 from .usm import AUTH_PROTOCOLS, PRIV_PROTOCOLS, UsmUser
 
@@ -77,6 +79,10 @@ class GatewayApp:
         self.restart_pending = False
         self.sending = False
         self.polling = False
+        self.diag_running = False
+        self.diag_checks: list[Check] = []
+        self.diag_when: datetime | None = None
+        self.diag_by_iid: dict[str, Check] = {}
 
         self._setup_style()
         self._build()
@@ -189,9 +195,11 @@ class GatewayApp:
         self.tab_traps = self._build_traps_tab()
         self.tab_devices = self._build_devices_tab()
         self.tab_rejected = self._build_rejected_tab()
+        self.tab_diag = self._build_diag_tab()
         self.tab_test = self._build_test_tab()
         self.tab_config = self._build_config_tab()
         self.tab_log = self._build_log_tab()
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _make_tree(self, parent: ttk.Frame, columns: list[tuple[str, str, int, bool]]) -> ttk.Treeview:
         tree = ttk.Treeview(parent, columns=[c[0] for c in columns], show="headings", selectmode="browse")
@@ -281,6 +289,51 @@ class GatewayApp:
         self.reject_tree = self._make_tree(tab, [
             ("time", "Time", 80, False), ("source", "Source", 140, False), ("kind", "Problem", 130, False),
             ("reason", "Reason", 700, True)])
+        return tab
+
+    # ------------------------------------------------------------------ diagnostics tab
+    def _build_diag_tab(self) -> ttk.Frame:
+        tab = ttk.Frame(self.nb, padding=(0, 10, 0, 0))
+        self.nb.add(tab, text="Diagnostics")
+        bar = ttk.Frame(tab)
+        bar.pack(side="top", fill="x", pady=(0, 8))
+        self.btn_diag = ttk.Button(bar, text="Run checks", style="Accent.TButton", command=self.run_checks)
+        self.btn_diag.pack(side="left")
+        self.diag_summary = ttk.Label(bar, text="Checks the configuration, ports, SNMPv3, OPC UA and this computer.",
+                                      style="Muted.TLabel")
+        self.diag_summary.pack(side="left", padx=(12, 0))
+        ttk.Button(bar, text="Save report…", command=self.save_report).pack(side="right")
+        ttk.Button(bar, text="Copy report", command=self.copy_report).pack(side="right", padx=(0, 6))
+
+        pane = ttk.Panedwindow(tab, orient="vertical")
+        pane.pack(side="top", fill="both", expand=True)
+        top = ttk.Frame(pane)
+        tree = ttk.Treeview(top, columns=["status", "result"], show="tree headings", selectmode="browse")
+        tree.heading("#0", text="Check", anchor="w")
+        tree.column("#0", width=280, minwidth=120, stretch=False, anchor="w")
+        tree.heading("status", text="Status", anchor="w")
+        tree.column("status", width=90, minwidth=60, stretch=False, anchor="w")
+        tree.heading("result", text="Result", anchor="w")
+        tree.column("result", width=640, minwidth=200, stretch=True, anchor="w")
+        ys = ttk.Scrollbar(top, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=ys.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        ys.grid(row=0, column=1, sticky="ns")
+        top.rowconfigure(0, weight=1)
+        top.columnconfigure(0, weight=1)
+        tree.tag_configure("problem", background=ALARM_TINT)
+        tree.tag_configure("warn", background=WARN_TINT)
+        tree.tag_configure("section", font=self.f_head)
+        tree.bind("<<TreeviewSelect>>", self._show_diag_detail)
+        self.diag_tree = tree
+        pane.add(top, weight=3)
+
+        bottom = ttk.Frame(pane, padding=(0, 8, 0, 0))
+        self.diag_detail = self._text_box(bottom, height=5, readonly=True, wrap="word")
+        self.diag_detail.configure(font=self.f_base)
+        self.diag_detail.tag_configure("head", font=self.f_head)
+        pane.add(bottom, weight=1)
+        self._set_diag_detail([("Select a check to see what was found and how to fix it.", "")])
         return tab
 
     # ------------------------------------------------------------------ test tab
@@ -600,6 +653,8 @@ class GatewayApp:
             self._on_error(payload)
         elif kind == "test_result":
             self._on_test_result(*payload)
+        elif kind == "diag_result":
+            self._on_diag_result(payload)
 
     def _tick(self) -> None:
         stats = self.ctl.stats()
@@ -755,6 +810,109 @@ class GatewayApp:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+
+    # ================================================================== diagnostics
+    def _on_tab_changed(self, _event=None) -> None:
+        if self.nb.select() != str(self.tab_diag) or self.diag_running:
+            return
+        if self.diag_when is None or (datetime.now() - self.diag_when).total_seconds() > 30:
+            self.run_checks()
+
+    def run_checks(self) -> None:
+        if self.diag_running:
+            return
+        self.diag_running = True
+        self.btn_diag.configure(state="disabled")
+        self.diag_summary.configure(text="Running checks…", style="Muted.TLabel")
+        tk_version = f"{tk.TkVersion}"
+
+        def work() -> None:
+            try:
+                result: object = run_diagnostics(self.ctl, tk_version=tk_version)
+            except Exception as exc:     # a bug here must not leave the button disabled
+                result = exc
+            self.ctl.events.put(("diag_result", result))
+
+        threading.Thread(target=work, name="diagnostics", daemon=True).start()
+
+    def _on_diag_result(self, result) -> None:
+        self.diag_running = False
+        self.btn_diag.configure(state="normal")
+        if isinstance(result, Exception):
+            self.diag_summary.configure(text=f"Checks failed to run: {result}", style="Error.TLabel")
+            return
+        self.diag_checks, self.diag_when = result, datetime.now()
+        tree = self.diag_tree
+        tree.delete(*tree.get_children())
+        self.diag_by_iid.clear()
+        sections: dict[str, list[Check]] = {}
+        for c in result:
+            sections.setdefault(c.section, []).append(c)
+        n = 0
+        for name, checks in sections.items():
+            worst = next((st for st in ("problem", "warn") if any(c.status == st for c in checks)), "")
+            sec_iid = f"sec{len(self.diag_by_iid)}_{n}"
+            tree.insert("", "end", iid=sec_iid, text=name, open=True, tags=("section",),
+                        values=(STATUS_LABEL[worst] if worst else "", summarize(checks)))
+            for c in checks:
+                n += 1
+                iid = f"chk{n}"
+                tree.insert(sec_iid, "end", iid=iid, text=c.name, values=(c.label, c.result),
+                            tags=(c.status,) if c.status in ("problem", "warn") else ())
+                self.diag_by_iid[iid] = c
+        summary = summarize(result)
+        problems = sum(c.status == "problem" for c in result)
+        self.diag_summary.configure(text=f"{summary}. Last run {self.diag_when:%H:%M:%S}.",
+                                    style="Error.TLabel" if problems else "TLabel")
+        self.nb.tab(self.tab_diag, text=f"Diagnostics ({problems})" if problems else "Diagnostics")
+        first_bad = next((iid for iid, c in self.diag_by_iid.items() if c.status in ("problem", "warn")), None)
+        if first_bad:
+            tree.selection_set(first_bad)
+            tree.see(first_bad)
+            self._show_diag_detail()
+
+    def _set_diag_detail(self, parts: list[tuple[str, str]]) -> None:
+        t = self.diag_detail
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        for text, tag in parts:
+            t.insert("end", text, (tag,) if tag else ())
+        t.configure(state="disabled")
+
+    def _show_diag_detail(self, _event=None) -> None:
+        sel = self.diag_tree.selection()
+        c = self.diag_by_iid.get(sel[0]) if sel else None
+        if c is None:
+            return
+        parts = [(f"{c.name}  ({c.label})\n", "head"), (c.result + "\n", "")]
+        if c.hint:
+            parts += [("\nHow to fix\n" if c.status in ("problem", "warn") else "\nNote\n", "head"), (c.hint, "")]
+        self._set_diag_detail(parts)
+
+    def copy_report(self) -> None:
+        if not self.diag_checks:
+            self.diag_summary.configure(text="Run the checks first.", style="Muted.TLabel")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(report_text(self.diag_checks, self.diag_when))
+        self.status_line.configure(text="Diagnostics report copied to the clipboard.")
+
+    def save_report(self) -> None:
+        if not self.diag_checks:
+            self.diag_summary.configure(text="Run the checks first.", style="Muted.TLabel")
+            return
+        when = self.diag_when or datetime.now()
+        path = filedialog.asksaveasfilename(parent=self.root, title="Save diagnostics report",
+                                            defaultextension=".txt", filetypes=[("Text", "*.txt")],
+                                            initialfile=f"snmp2opcua-diagnostics-{when:%Y%m%d-%H%M}.txt")
+        if not path:
+            return
+        try:
+            Path(path).write_text(report_text(self.diag_checks, when), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Save report", f"Couldn't write {path}: {exc}", parent=self.root)
+            return
+        self.status_line.configure(text=f"Diagnostics report saved to {path}")
 
     # ================================================================== test traps
     def _update_test_form(self) -> None:

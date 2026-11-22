@@ -188,6 +188,11 @@ class OpcUaServerPublisher:
             ev.VarBindsJson = varbinds_json
             await self.evgen.trigger(message=trap.summary())
 
+    def diagnostics(self) -> dict:
+        return {"kind": "server", "endpoint": self.cfg["endpoint"], "running": self.server is not None,
+                "namespace_index": self.idx, "devices": len(self.devices), "max_devices": self.max_devices,
+                "events": self.evgen is not None}
+
     async def update_status(self, stats: Stats) -> None:
         if self.server is None:
             return

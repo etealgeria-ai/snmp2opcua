@@ -16,6 +16,7 @@ import socket
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -90,6 +91,8 @@ class GatewayController:
         self._gateway: Gateway | None = None
         self.started_at: datetime | None = None
         self.publisher_factory = None      # tests can inject a fake OPC UA publisher
+        self.trap_times: deque[float] = deque(maxlen=20000)   # monotonic receive times, for rates
+        self.last_trap_at: datetime | None = None
         self.log_handler = QueueLogHandler(self.events)
         root = logging.getLogger()
         if self.log_handler not in root.handlers:
@@ -184,6 +187,8 @@ class GatewayController:
                            opcua=self._opcua_target())
             self.events.put(("started", payload))
         elif kind == "trap":
+            self.trap_times.append(time.monotonic())
+            self.last_trap_at = datetime.now()
             d = payload.to_dict()
             sev = self.severity.for_trap(payload)
             d["severity"] = sev
@@ -221,6 +226,32 @@ class GatewayController:
             queued = 0
         return {"received": s.received, "published": s.published, "queued": queued,
                 "rejected": s.rejected, "malformed": s.malformed, "dropped": s.dropped}
+
+    def snapshot(self) -> dict:
+        """Runtime state for the diagnostics page, collected safely inside the gateway's thread."""
+        loop, gw = self._loop, self._gateway
+        if loop is None or gw is None:
+            return {}
+
+        async def collect() -> dict:
+            v3 = gw.v3
+            pub = gw.publisher
+            return {
+                "queue": gw.queue.qsize(), "queue_max": gw.queue.maxsize,
+                "v3": None if v3 is None else {
+                    "engine_id": v3.engine_id.hex(), "boots": v3.boots, "engine_time": v3.engine_time(),
+                    "counters": dict(v3.counters), "remote": v3.remote_engines(),
+                    "replay_protection": v3.replay_protection},
+                "publisher": pub.diagnostics() if hasattr(pub, "diagnostics") else {},
+            }
+        try:
+            return asyncio.run_coroutine_threadsafe(collect(), loop).result(timeout=3)
+        except Exception:
+            return {}
+
+    def trap_rate(self, seconds: float) -> int:
+        cutoff = time.monotonic() - seconds
+        return sum(1 for t in reversed(self.trap_times) if t >= cutoff) if self.trap_times else 0
 
     # ------------------------------------------------------------------ test traps
     def configured_users(self) -> list[UsmUser]:
