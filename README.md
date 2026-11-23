@@ -1,5 +1,7 @@
 # snmp2opcua: SNMP trap to OPC UA gateway
 
+**Made by ClaudeAI**
+
 > **Written by Claude.** The code, tests and this README were written by Claude (Anthropic's AI model, Claude Opus 5.5) in November 2026, at the request of the repository owner.
 >
 > **What it was tested against:**
