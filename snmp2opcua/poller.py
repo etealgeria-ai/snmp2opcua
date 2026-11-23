@@ -15,7 +15,7 @@ Per device (``polling:`` in the config):
   "disassociated". If the master doesn't report link status, listed means online.
   LastSeen is the last poll that found the remote online.
 
-* fixed RSSI tags Remote1..RemoteN (``remote_tags``, default 50) for SCADA screens:
+* fixed RSSI tags Remote1..RemoteN (``remote_tags``, default 255) for SCADA screens:
 
       <Channel>.<Device>.Remote7          RSSI in dBm of the radio numbered 7
       <Channel>.<Device>.Remote7_IP / Remote7_MAC / Remote7_Online

@@ -262,7 +262,7 @@ channels:
 
 | Tag | Type | Meaning |
 |---|---|---|
-| `Radios.Master_LN4.Remote1` … `Remote50` | Int32 | RSSI in dBm of the radio with that number, e.g. `ns=2;s=Radios.Master_LN4.Remote7` |
+| `Radios.Master_LN4.Remote1` … `Remote255` | Int32 | RSSI in dBm of the radio with that number, e.g. `ns=2;s=Radios.Master_LN4.Remote7` |
 | `….Remote7_IP` / `_MAC` / `_Online` | String / String / Boolean | Which radio Remote7 is, and whether its link is up |
 | `Radios.Master_LN4.Remotes.<MAC>.RSSI` | Int32 | The same RSSI, by MAC, e.g. `ns=2;s=Radios.Master_LN4.Remotes.00063D123456.RSSI` |
 | `….Remotes.<MAC>.IP` / `.MAC` / `.IfIndex` | String / String / Int32 | The remote's address and row index |
@@ -271,11 +271,11 @@ channels:
 | `….Remotes.Count` / `.OnlineCount` | UInt32 | Remotes ever seen / online in the last poll |
 | `…._Polling.OK` / `.Error` / `.LastPoll` / `.DurationMs` / `.Failures` | | Poll status |
 
-**Remote numbering (Remote1 … Remote50):** SCADA screens can bind to fixed tags, so every radio keeps its number.
+**Remote numbering (Remote1 … Remote255):** SCADA screens can bind to fixed tags, so every radio keeps its number.
 - A newly seen remote takes the lowest free number. The numbering is saved in `polling_state_file` (next to the config), so it survives restarts.
 - A remote that goes offline keeps its number. So does one that hasn't been seen since a restart.
 - To fix numbers for good, pin them under `polling.remote_slots` (number → MAC or IP), or press **Lock current numbers** on the Stations page. Pins take precedence, and their numbers stay reserved until that radio appears.
-- Unused numbers have Bad quality. Change the count with `remote_tags` (0 turns them off) and the name with `remote_tag_prefix`.
+- Unused numbers have Bad quality. Change the count with `remote_tags` (default 255, up to 1000; 0 turns them off) and the name with `remote_tag_prefix`.
 - If there are more remotes than numbers, the Radios view and Diagnostics say which radios have no tag.
 
 How the tags behave:

@@ -273,7 +273,7 @@ class PollerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(names[:7], ["_Polling.OK", "_Polling.Error", "_Polling.LastPoll", "_Polling.DurationMs",
                                          "_Polling.Failures", "Remotes.Count", "Remotes.OnlineCount"])
             self.assertEqual(names[7:11], ["Remote1", "Remote1_IP", "Remote1_MAC", "Remote1_Online"])
-            self.assertEqual((len(names), names[-1]), (7 + 50 * 4, "Remote50_Online"))
+            self.assertEqual((len(names), names[-1]), (7 + 255 * 4, "Remote255_Online"))
         finally:
             p.close()
 
@@ -310,7 +310,7 @@ class RemoteNumberingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([v[f"Remote{i}_MAC"][0] for i in (1, 2, 3)], [m for m, _, _ in REMOTES])
                 self.assertEqual((v["Remote2"], v["Remote2_IP"], v["Remote2_Online"]),
                                  ((-97, True), ("10.10.1.22", True), (True, True)))
-                self.assertEqual((v["Remote4"], v["Remote4_MAC"], v["Remote50_IP"]),
+                self.assertEqual((v["Remote4"], v["Remote4_MAC"], v["Remote255_IP"]),
                                  ((0, False), ("", False), ("", False)))           # unused: Bad quality
                 self.assertEqual({r["mac"]: r["tag"] for r in p.radios()}["00:06:3D:12:34:57"], "Remote2")
 
@@ -376,7 +376,7 @@ class RemoteNumberingTests(unittest.IsolatedAsyncioTestCase):
             return str(ctx.exception)
         self.assertIn("not a MAC address", err(remote_slots={1: "radio-7"}))
         self.assertIn("pinned to both", err(remote_slots={1: "10.0.0.1", 2: "10.0.0.1"}))
-        self.assertIn("remote_slots key 51", err(remote_slots={51: "10.0.0.1"}))
+        self.assertIn("remote_slots key 256", err(remote_slots={256: "10.0.0.1"}))
         self.assertIn("remote tag prefix", err(remote_tag_prefix="Re.mote"))
 
 

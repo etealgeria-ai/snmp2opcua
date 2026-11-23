@@ -244,7 +244,7 @@ class PollConfig:
     max_repetitions: int = 20
     ge_orbit_remotes: bool = False    # read RSSI/IP of remote radios from a GE MDS Orbit master
     rssi_warning_dbm: int | None = None
-    remote_tags: int = 50             # fixed tags Remote1..RemoteN (RSSI), 0 = none
+    remote_tags: int = 255            # fixed tags Remote1..RemoteN (RSSI), 0 = none
     remote_tag_prefix: str = "Remote"
     remote_slots: dict[int, str] = field(default_factory=dict)   # pinned: slot -> MAC or IP
 
@@ -449,7 +449,7 @@ def _poll_config(p: dict, dev: DeviceDef, where: str) -> PollConfig:
     if version not in ("1", "2c"):
         raise DriverConfigError(f"{where}: polling supports SNMP version 1 or 2c; set polling.snmp_version")
     warn = p.get("rssi_warning_dbm")
-    remote_tags = _int(p.get("remote_tags"), 0, 1000, f"{where}: remote_tags", 50)
+    remote_tags = _int(p.get("remote_tags"), 0, 1000, f"{where}: remote_tags", 255)
     prefix = _check_name("remote tag prefix", p.get("remote_tag_prefix", "Remote"))
     slots: dict[int, str] = {}
     seen_ids: dict[str, int] = {}

@@ -57,8 +57,8 @@ def loads(text):
 class RemoteTagFormTests(unittest.TestCase):
     def test_count_prefix_and_lock(self):
         orig = list_stations(TEXT)[0]
-        self.assertEqual((orig.remote_tags, orig.remote_tag_prefix), (50, "Remote"))
-        st, probs = parse_form(form(remote_tags="50", remote_tag_prefix="Remote"), orig, TEXT)
+        self.assertEqual((orig.remote_tags, orig.remote_tag_prefix), (255, "Remote"))
+        st, probs = parse_form(form(remote_tags="255", remote_tag_prefix="Remote"), orig, TEXT)
         self.assertEqual(save_station(TEXT, st, orig), TEXT)                 # defaults aren't written
         st, _ = parse_form(form(remote_tags="64", remote_tag_prefix="Radio"), orig, TEXT)
         out = save_station(TEXT, st, orig)

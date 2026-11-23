@@ -34,7 +34,7 @@ class Station:
     rssi_warning_dbm: int | None = None
     receive_traps: bool = True
     auto_create_tags: bool = True
-    remote_tags: int = 50
+    remote_tags: int = 255
     remote_tag_prefix: str = "Remote"
     # where it lives in config.yaml (None for a new station)
     ci: int | None = None
@@ -66,7 +66,7 @@ def list_stations(text: str) -> list[Station]:
                 rssi_warning_dbm=None if p.get("rssi_warning_dbm") is None else int(p["rssi_warning_dbm"]),
                 receive_traps=bool((d.get("trap") or {}).get("enabled", True)),
                 auto_create_tags=bool(d.get("auto_create_tags", True)),
-                remote_tags=int(p.get("remote_tags", 50)), remote_tag_prefix=str(p.get("remote_tag_prefix", "Remote")),
+                remote_tags=int(p.get("remote_tags", 255)), remote_tag_prefix=str(p.get("remote_tag_prefix", "Remote")),
                 ci=ci, di=di, raw=dict(d)))
     return out
 
@@ -139,7 +139,7 @@ def parse_form(values: dict, original: Station | None, text: str) -> tuple[Stati
     timeout_ms = _int(values.get("timeout_ms", ""), "timeout_ms", 50, 60000, "Timeout", problems)
     retries = _int(values.get("retries", ""), "retries", 0, 10, "Retries", problems)
     max_reps = _int(values.get("max_repetitions", ""), "max_repetitions", 1, 200, "Max repetitions", problems)
-    remote_tags = _int(values.get("remote_tags", "50"), "remote_tags", 0, 1000, "Number of RSSI tags", problems)
+    remote_tags = _int(values.get("remote_tags", "255"), "remote_tags", 0, 1000, "Number of RSSI tags", problems)
     prefix = str(values.get("remote_tag_prefix", "Remote")).strip()
     try:
         _check_name("tag", prefix)
@@ -217,7 +217,7 @@ def save_station(text: str, st: Station, original: Station | None) -> str:
             text = set_in(text, base + ["trap", "enabled"], st.receive_traps)
         dev_version = str(raw.get("snmp_version", "2c")).lstrip("v")
         effective = {"community": "public", "port": 161, "scan_rate_ms": 10000, "timeout_ms": 2000, "retries": 1,
-                     "max_repetitions": 20, "ge_orbit_remotes": True, "remote_tags": 50,
+                     "max_repetitions": 20, "ge_orbit_remotes": True, "remote_tags": 255,
                      "remote_tag_prefix": "Remote",
                      "snmp_version": dev_version if dev_version in ("1", "2c") else None}
         effective.update(rawp)
