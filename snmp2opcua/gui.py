@@ -9,6 +9,7 @@ dropped traps get colour, and always with a text label as well.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import logging
@@ -31,6 +32,7 @@ except ImportError:  # pragma: no cover - reported in main()
 from .diagnostics import STATUS_LABEL, Check, report_text, run_diagnostics, summarize
 from .gui_controller import GatewayController, TrapRequest, parse_varbind_lines
 from .snmp_driver import DeviceDef, EventsAddress
+from . import snmp_settings
 from . import stations as stations_mod
 from .ge_orbit import Remote, format_report
 from .tag_csv import TagCsvError, read_tags, write_tags
@@ -99,6 +101,12 @@ class GatewayApp:
         self.station_dirty = False
         self.station_loading = False
         self.station_testing = False
+        self.snmp_state: snmp_settings.SnmpSettings | None = None      # the SNMP page's working copy
+        self.snmp_orig: snmp_settings.SnmpSettings | None = None       # as in the file
+        self.snmp_editing: snmp_settings.V3User | None = None
+        self.snmp_user_form_loaded: dict = {}
+        self.snmp_dirty = False
+        self.snmp_loading = False
         self.live: dict[str, dict] = {}                   # path -> value, good, dtype, source, updated, count, changed
         self.live_paused = False
         self.live_unseen = 0
@@ -220,6 +228,7 @@ class GatewayApp:
         self.tab_devices = self._build_devices_tab()
         self.tab_rejected = self._build_rejected_tab()
         self.tab_diag = self._build_diag_tab()
+        self.tab_snmp = self._build_snmp_tab()
         self.tab_stations = self._build_stations_tab()
         self.tab_test = self._build_test_tab()
         self.tab_config = self._build_config_tab()
@@ -882,6 +891,412 @@ class GatewayApp:
         self._set_diag_detail([("Select a check to see what was found and how to fix it.", "")])
         return tab
 
+    # ------------------------------------------------------------------ snmp tab
+    def _build_snmp_tab(self) -> ttk.Frame:
+        tab = ttk.Frame(self.nb, padding=(0, 10, 0, 0))
+        self.nb.add(tab, text="SNMP")
+        ttk.Label(tab, text="What the gateway listens on and which traps it accepts. Saved to the configuration "
+                            "file; restart the gateway to apply.", style="Muted.TLabel").pack(side="top", anchor="w")
+        body = ttk.Frame(tab)
+        body.pack(side="top", fill="both", expand=True, pady=(8, 0))
+        body.columnconfigure(0, weight=1, uniform="snmp")
+        body.columnconfigure(1, weight=1, uniform="snmp")
+        left, right = ttk.Frame(body), ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        self.snmp_vars: dict[str, tk.StringVar] = {k: tk.StringVar() for k in (
+            "if_address", "if_port", "community", "host", "engine_id",
+            "u_name", "u_auth", "u_auth_key", "u_priv", "u_priv_key", "u_engine_ids")}
+        self.snmp_flags: dict[str, tk.BooleanVar] = {k: tk.BooleanVar() for k in (
+            "accept_all", "v1", "v2c", "v3", "informs", "replay", "show_keys")}
+        for k in ("accept_all", "v1", "v2c", "v3", "informs", "replay"):
+            self.snmp_flags[k].trace_add("write", lambda *_: self._mark_snmp_dirty())
+        self.snmp_vars["engine_id"].trace_add("write", lambda *_: self._mark_snmp_dirty())
+        self.snmp_widgets: dict[str, Any] = {}      # entries and comboboxes by field
+
+        def section(parent, title: str, expand: bool = False) -> ttk.Labelframe:
+            f = ttk.Labelframe(parent, text=title, padding=(12, 8))
+            f.pack(side="top", fill="both" if expand else "x", expand=expand, pady=(0, 10))
+            f.columnconfigure(0, weight=1)
+            return f
+
+        def table(parent, columns, height: int) -> ttk.Treeview:
+            box = ttk.Frame(parent)
+            box.grid(row=0, column=0, columnspan=4, sticky="nsew")
+            tree = self._make_tree(box, columns)
+            tree.configure(height=height)
+            return tree
+
+        # network interfaces
+        ni = section(left, "Network interfaces")
+        self.snmp_if_tree = table(ni, [("address", "Address", 150, True), ("port", "UDP port", 80, False)], 3)
+        add = ttk.Frame(ni)
+        add.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(add, text="Address").pack(side="left")
+        self.snmp_widgets["if_address"] = ttk.Entry(add, textvariable=self.snmp_vars["if_address"], width=15)
+        self.snmp_widgets["if_address"].pack(side="left", padx=(6, 10))
+        ttk.Label(add, text="Port").pack(side="left")
+        self.snmp_widgets["if_port"] = ttk.Entry(add, textvariable=self.snmp_vars["if_port"], width=7)
+        self.snmp_widgets["if_port"].pack(side="left", padx=(6, 10))
+        ttk.Button(add, text="Add", command=self.snmp_add_interface).pack(side="left")
+        ttk.Button(add, text="Remove", command=lambda: self._snmp_remove("listeners", self.snmp_if_tree)
+                   ).pack(side="left", padx=(6, 0))
+        ttk.Label(ni, text="0.0.0.0 listens on every interface. Ports below 1024 (the standard 162) need "
+                           "administrator rights. Devices with their own trap port add listeners too.",
+                  style="Small.TLabel", wraplength=380, justify="left").grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        # communities
+        cm = section(left, "Communities (SNMP v1 and v2c)")
+        self.snmp_comm_tree = table(cm, [("community", "Community", 200, True)], 3)
+        add = ttk.Frame(cm)
+        add.grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.snmp_widgets["community"] = ttk.Entry(add, textvariable=self.snmp_vars["community"], width=22)
+        self.snmp_widgets["community"].pack(side="left", padx=(0, 10))
+        ttk.Button(add, text="Add", command=self.snmp_add_community).pack(side="left")
+        ttk.Button(add, text="Remove", command=lambda: self._snmp_remove("communities", self.snmp_comm_tree)
+                   ).pack(side="left", padx=(6, 0))
+        ttk.Label(cm, text="Traps with other communities are rejected. With no communities, any is accepted.",
+                  style="Small.TLabel", wraplength=380, justify="left").grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+        # hosts
+        ho = section(left, "Hosts", expand=True)
+        ttk.Checkbutton(ho, text="Accept packets from all hosts", variable=self.snmp_flags["accept_all"],
+                        command=self._update_snmp_widgets).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        box = ttk.Frame(ho)
+        box.grid(row=1, column=0, sticky="nsew")
+        ho.rowconfigure(1, weight=1)
+        self.snmp_host_tree = self._make_tree(box, [("host", "Accept only from these hosts or networks", 260, True)])
+        self.snmp_host_tree.configure(height=3)
+        add = ttk.Frame(ho)
+        add.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.snmp_widgets["host"] = ttk.Entry(add, textvariable=self.snmp_vars["host"], width=22)
+        self.snmp_widgets["host"].pack(side="left", padx=(0, 10))
+        self.btn_snmp_host_add = ttk.Button(add, text="Add", command=self.snmp_add_host)
+        self.btn_snmp_host_add.pack(side="left")
+        self.btn_snmp_host_remove = ttk.Button(add, text="Remove",
+                                               command=lambda: self._snmp_remove("allowed_sources", self.snmp_host_tree))
+        self.btn_snmp_host_remove.pack(side="left", padx=(6, 0))
+        ttk.Label(ho, text="An address such as 192.168.1.20 or a network such as 10.10.0.0/16.",
+                  style="Small.TLabel").grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+        # versions
+        ve = section(right, "Versions")
+        vrow = ttk.Frame(ve)
+        vrow.grid(row=0, column=0, sticky="w")
+        ttk.Label(vrow, text="Accept").pack(side="left", padx=(0, 10))
+        for v, label in (("v1", "SNMP v1"), ("v2c", "SNMP v2c"), ("v3", "SNMPv3")):
+            ttk.Checkbutton(vrow, text=label, variable=self.snmp_flags[v], command=self._update_snmp_widgets
+                            ).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(ve, text="Acknowledge INFORMs (and answer SNMPv3 engine discovery)",
+                        variable=self.snmp_flags["informs"]).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        # SNMPv3
+        v3 = section(right, "SNMPv3", expand=True)
+        eng = ttk.Frame(v3)
+        eng.grid(row=0, column=0, sticky="ew")
+        ttk.Label(eng, text="Engine ID").pack(side="left")
+        self.snmp_widgets["engine_id"] = ttk.Entry(eng, textvariable=self.snmp_vars["engine_id"], width=30)
+        self.snmp_widgets["engine_id"].pack(side="left", padx=(8, 8))
+        ttk.Label(eng, text="Empty = generated once and kept", style="Small.TLabel").pack(side="left")
+        ttk.Checkbutton(v3, text="Replay protection (reject old or repeated v3 traps)",
+                        variable=self.snmp_flags["replay"]).grid(row=1, column=0, sticky="w", pady=(6, 8))
+        box = ttk.Frame(v3)
+        box.grid(row=2, column=0, sticky="nsew")
+        v3.rowconfigure(2, weight=1)
+        self.snmp_user_tree = self._make_tree(box, [
+            ("user", "User", 110, True), ("level", "Security", 95, False), ("auth", "Auth", 70, False),
+            ("priv", "Privacy", 70, False), ("engines", "Engine IDs", 110, True)])
+        self.snmp_user_tree.configure(height=4)
+        self.snmp_user_tree.bind("<<TreeviewSelect>>", self._on_snmp_user_select)
+
+        ed = ttk.Frame(v3)
+        ed.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ed.columnconfigure(1, weight=1)
+
+        def field(r: int, label: str, key: str, width: int, combo: list[str] | None = None, secret: bool = False):
+            ttk.Label(ed, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=2)
+            if combo is not None:
+                w: ttk.Entry | ttk.Combobox = ttk.Combobox(ed, textvariable=self.snmp_vars[key], values=combo,
+                                                           state="readonly", width=width)
+                w.bind("<<ComboboxSelected>>", lambda _e: self._update_snmp_widgets())
+            else:
+                w = ttk.Entry(ed, textvariable=self.snmp_vars[key], width=width, show="•" if secret else "")
+            w.grid(row=r, column=1, sticky="w", pady=2)
+            self.snmp_widgets[key] = w
+            return w
+
+        field(0, "User name", "u_name", 20)
+        field(1, "Authentication", "u_auth", 10, snmp_settings.AUTH_CHOICES)
+        field(2, "Authentication key", "u_auth_key", 24, secret=True)
+        ttk.Checkbutton(ed, text="Show keys", variable=self.snmp_flags["show_keys"], command=self._update_snmp_widgets
+                        ).grid(row=2, column=2, sticky="w", padx=(10, 0))
+        field(3, "Privacy", "u_priv", 10, snmp_settings.PRIV_CHOICES)
+        field(4, "Privacy key", "u_priv_key", 24, secret=True)
+        field(5, "Engine IDs", "u_engine_ids", 30)
+        ttk.Label(ed, text="Optional: only accept this user's traps from these devices (comma-separated hex). "
+                           "Keys can be ${VARIABLE} to keep them out of the file.",
+                  style="Small.TLabel", wraplength=380, justify="left").grid(row=6, column=0, columnspan=3,
+                                                                             sticky="w", pady=(2, 6))
+        ub = ttk.Frame(ed)
+        ub.grid(row=7, column=0, columnspan=3, sticky="w")
+        ttk.Button(ub, text="New user", command=self.snmp_new_user).pack(side="left")
+        self.btn_snmp_user_apply = ttk.Button(ub, text="Add user", command=self.snmp_apply_user)
+        self.btn_snmp_user_apply.pack(side="left", padx=(6, 0))
+        self.btn_snmp_user_remove = ttk.Button(ub, text="Remove user", command=self.snmp_remove_user)
+        self.btn_snmp_user_remove.pack(side="left", padx=(6, 0))
+
+        actions = ttk.Frame(tab)
+        actions.pack(side="top", fill="x", pady=(4, 0))
+        ttk.Button(actions, text="Save and restart", style="Accent.TButton",
+                   command=lambda: self.save_snmp(restart=True)).pack(side="right")
+        ttk.Button(actions, text="Save", command=self.save_snmp).pack(side="right", padx=(0, 6))
+        ttk.Button(actions, text="Revert", command=self.revert_snmp).pack(side="right", padx=(0, 6))
+        self.snmp_msg = ttk.Label(tab, text="", style="Muted.TLabel", wraplength=900, justify="left")
+        self.snmp_msg.pack(side="top", anchor="w", pady=(8, 0))
+        return tab
+
+    def _snmp_message(self, text: str, error: bool = False) -> None:
+        self.snmp_msg.configure(text=text, style="Error.TLabel" if error else "Muted.TLabel")
+
+    def _mark_snmp_dirty(self) -> None:
+        if not self.snmp_loading:
+            self.snmp_dirty = True
+
+    def _refresh_snmp(self, force: bool = False) -> None:
+        """Load the snmp: section from the file (kept as is while there are unsaved edits, unless forced)."""
+        if self.snmp_dirty and not force:
+            return
+        try:
+            st = snmp_settings.load_settings(self.ctl.read_text())
+        except (OSError, ValueError) as exc:
+            self._snmp_message(f"Can't read the SNMP settings: {exc}", error=True)
+            return
+        self.snmp_orig = st
+        self.snmp_state = copy.deepcopy(st)
+        self.snmp_loading = True
+        try:
+            self.snmp_flags["accept_all"].set(st.accept_all_hosts)
+            for v in snmp_settings.VERSIONS:
+                self.snmp_flags[v].set(v in st.versions)
+            self.snmp_flags["informs"].set(st.respond_to_informs)
+            self.snmp_flags["replay"].set(st.replay_protection)
+            self.snmp_vars["engine_id"].set(st.engine_id)
+            self.snmp_vars["if_address"].set("0.0.0.0")
+            self.snmp_vars["if_port"].set("162")
+            for k in ("community", "host"):
+                self.snmp_vars[k].set("")
+        finally:
+            self.snmp_loading = False
+        self.snmp_dirty = False
+        self._fill_snmp_lists()
+        self.snmp_new_user()
+        _problems, warnings = snmp_settings.check_settings(st)
+        self._snmp_message(" ".join(warnings), error=bool(warnings))
+
+    def _fill_snmp_lists(self) -> None:
+        st = self.snmp_state
+        if st is None:
+            return
+        rows: list[tuple[ttk.Treeview, list[tuple]]] = [
+                (self.snmp_if_tree, [(x.address, x.port) for x in st.listeners]),
+                (self.snmp_comm_tree, [(c,) for c in st.communities]),
+                (self.snmp_host_tree, [(h,) for h in st.allowed_sources]),
+                (self.snmp_user_tree, [(u.name + (" ⚠" if u.missing_variables() else ""), u.level, u.auth_protocol,
+                                        u.priv_protocol, ", ".join(u.engine_ids) or "any") for u in st.users])]
+        for tree, values in rows:
+            tree.delete(*tree.get_children())
+            for i, v in enumerate(values):
+                tree.insert("", "end", iid=f"r{i}", values=v)
+        self._update_snmp_widgets()
+
+    def _update_snmp_widgets(self) -> None:
+        all_hosts = self.snmp_flags["accept_all"].get()
+        for w in (self.snmp_widgets["host"], self.btn_snmp_host_add, self.btn_snmp_host_remove):
+            w.configure(state="disabled" if all_hosts else "normal")
+        show = "" if self.snmp_flags["show_keys"].get() else "•"
+        auth = (self.snmp_vars["u_auth"].get() or "NONE").upper()
+        priv = (self.snmp_vars["u_priv"].get() or "NONE").upper()
+        self.snmp_widgets["u_auth_key"].configure(show=show, state="disabled" if auth == "NONE" else "normal")
+        self.snmp_widgets["u_priv"].configure(state="disabled" if auth == "NONE" else "readonly")
+        self.snmp_widgets["u_priv_key"].configure(
+            show=show, state="disabled" if auth == "NONE" or priv == "NONE" else "normal")
+        self.btn_snmp_user_apply.configure(text="Update user" if self.snmp_editing is not None else "Add user")
+        self.btn_snmp_user_remove.configure(state="normal" if self.snmp_editing is not None else "disabled")
+
+    def _snmp_selected(self, tree: ttk.Treeview) -> int | None:
+        sel = tree.selection()
+        return int(sel[0][1:]) if sel else None
+
+    def _snmp_remove(self, attr: str, tree: ttk.Treeview) -> None:
+        i = self._snmp_selected(tree)
+        items = getattr(self.snmp_state, attr)
+        if i is None or i >= len(items):
+            self._snmp_message("Select an entry to remove first.", error=True)
+            return
+        removed = items.pop(i)
+        self.snmp_dirty = True
+        self._fill_snmp_lists()
+        label = removed.label if isinstance(removed, snmp_settings.Listener) else removed
+        self._snmp_message(f"Removed {label}. Save to keep the change.")
+
+    def snmp_add_interface(self) -> None:
+        st = self.snmp_state
+        assert st is not None
+        item, problem = snmp_settings.check_listener(self.snmp_vars["if_address"].get(),
+                                                     self.snmp_vars["if_port"].get(), st.listeners)
+        if item is None:
+            self._snmp_message(problem, error=True)
+            self.snmp_widgets["if_address" if "address" in problem.lower() else "if_port"].focus_set()
+            return
+        st.listeners.append(item)
+        if len(st.listeners) > 1:
+            st.uses_interfaces = True
+        self.snmp_dirty = True
+        self._fill_snmp_lists()
+        self._snmp_message(f"Added {item.label}. Save to keep the change.")
+
+    def snmp_add_community(self) -> None:
+        st = self.snmp_state
+        assert st is not None
+        item, problem = snmp_settings.check_community(self.snmp_vars["community"].get(), st.communities)
+        if item is None:
+            self._snmp_message(problem, error=True)
+            self.snmp_widgets["community"].focus_set()
+            return
+        st.communities.append(item)
+        self.snmp_vars["community"].set("")
+        self.snmp_dirty = True
+        self._fill_snmp_lists()
+        self._snmp_message(f"Added the community {item}. Save to keep the change.")
+
+    def snmp_add_host(self) -> None:
+        st = self.snmp_state
+        assert st is not None
+        item, problem = snmp_settings.check_host(self.snmp_vars["host"].get(), st.allowed_sources)
+        if item is None:
+            self._snmp_message(problem, error=True)
+            self.snmp_widgets["host"].focus_set()
+            return
+        st.allowed_sources.append(item)
+        self.snmp_vars["host"].set("")
+        self.snmp_dirty = True
+        self._fill_snmp_lists()
+        self._snmp_message(f"Added {item}. Save to keep the change.")
+
+    # SNMPv3 users
+    def _user_form(self) -> dict:
+        return {"name": self.snmp_vars["u_name"].get(), "auth_protocol": self.snmp_vars["u_auth"].get(),
+                "auth_key": self.snmp_vars["u_auth_key"].get(), "priv_protocol": self.snmp_vars["u_priv"].get(),
+                "priv_key": self.snmp_vars["u_priv_key"].get(), "engine_ids": self.snmp_vars["u_engine_ids"].get()}
+
+    def _load_user_form(self, u: snmp_settings.V3User | None) -> None:
+        self.snmp_editing = u
+        src = u or snmp_settings.V3User("", "SHA256", "", "AES", "")
+        values = {"u_name": src.name, "u_auth": src.auth_protocol, "u_auth_key": src.auth_key,
+                  "u_priv": src.priv_protocol, "u_priv_key": src.priv_key, "u_engine_ids": ", ".join(src.engine_ids)}
+        for k, v in values.items():
+            self.snmp_vars[k].set(v)
+        self.snmp_user_form_loaded = self._user_form()
+        self._update_snmp_widgets()
+
+    def _user_form_pending(self) -> bool:
+        form = self._user_form()
+        if self.snmp_editing is None:
+            return bool(form["name"].strip())
+        return form != self.snmp_user_form_loaded
+
+    def _on_snmp_user_select(self, _event=None) -> None:
+        i = self._snmp_selected(self.snmp_user_tree)
+        if i is None or self.snmp_state is None or i >= len(self.snmp_state.users):
+            return
+        self._load_user_form(self.snmp_state.users[i])
+
+    def snmp_new_user(self) -> None:
+        self.snmp_user_tree.selection_set()
+        self._load_user_form(None)
+
+    def snmp_apply_user(self) -> None:
+        st = self.snmp_state
+        assert st is not None
+        user, problems = snmp_settings.check_user(self._user_form(), st.users, self.snmp_editing)
+        if user is None:
+            self._snmp_message(" ".join(problems), error=True)
+            return
+        if self.snmp_editing is not None:
+            st.users[st.users.index(self.snmp_editing)] = user
+            verb = "Updated"
+        else:
+            st.users.append(user)
+            verb = "Added"
+        self.snmp_dirty = True
+        self._fill_snmp_lists()
+        i = st.users.index(user)
+        self.snmp_user_tree.selection_set(f"r{i}")
+        self._load_user_form(user)
+        note = f" {', '.join(user.missing_variables())} isn't set on this computer." if user.missing_variables() else ""
+        self._snmp_message(f"{verb} the user {user.name} ({user.level}). Save to keep the change.{note}")
+
+    def snmp_remove_user(self) -> None:
+        st = self.snmp_state
+        u = self.snmp_editing
+        if st is None or u is None:
+            return
+        st.users.remove(u)
+        self.snmp_dirty = True
+        self._fill_snmp_lists()
+        self.snmp_new_user()
+        self._snmp_message(f"Removed the user {u.name}. Save to keep the change.")
+
+    def revert_snmp(self) -> None:
+        self._refresh_snmp(force=True)
+        self._snmp_message("Reverted to the settings in the file.")
+
+    def _snmp_from_form(self) -> snmp_settings.SnmpSettings:
+        st = copy.deepcopy(self.snmp_state)
+        assert st is not None
+        st.accept_all_hosts = self.snmp_flags["accept_all"].get()
+        st.versions = [v for v in snmp_settings.VERSIONS if self.snmp_flags[v].get()]
+        st.respond_to_informs = self.snmp_flags["informs"].get()
+        st.replay_protection = self.snmp_flags["replay"].get()
+        st.engine_id = self.snmp_vars["engine_id"].get().strip()
+        return st
+
+    def save_snmp(self, restart: bool = False) -> None:
+        if self.snmp_state is None or self.snmp_orig is None or self._editor_blocks("SNMP"):
+            return
+        if self._user_form_pending():
+            self._snmp_message("The SNMPv3 user form has changes that aren't in the list yet. Click "
+                               f"{'Update user' if self.snmp_editing else 'Add user'}, or New user to clear it.",
+                               error=True)
+            return
+        st = self._snmp_from_form()
+        problems, warnings = snmp_settings.check_settings(st)
+        if problems:
+            self._snmp_message("Not saved. " + " ".join(m for _, m in problems), error=True)
+            return
+        try:
+            new_text = snmp_settings.save_settings(self.ctl.read_text(), st, self.snmp_orig)
+            self.ctl.save_text(new_text)
+        except (ValueError, OSError) as exc:
+            self._snmp_message(f"Not saved: {exc}", error=True)
+            return
+        self.snmp_dirty = False
+        self._load_config_into_ui()
+        self._refresh_snmp(force=True)
+        extra = (" " + " ".join(warnings)) if warnings else ""
+        if restart:
+            self._snmp_message("Saved the SNMP settings. Restarting the gateway…" + extra)
+            if self.ctl.running:
+                self.restart_pending = True
+                self.stop()
+            else:
+                self.start()
+        else:
+            self._snmp_message(f"Saved the SNMP settings to {self.ctl.config_path.name} (previous version kept as "
+                               ".bak)." + (" Restart the gateway to apply them." if self.ctl.running else "") + extra,
+                               error=bool(warnings))
+
     # ------------------------------------------------------------------ stations tab
     STATION_FIELDS = ["channel", "name", "ip", "community", "version", "port", "scan_rate_s", "timeout_ms",
                       "retries", "max_repetitions", "rssi_warning_dbm", "remote_tags", "remote_tag_prefix"]
@@ -1087,9 +1502,9 @@ class GatewayApp:
         v.update({k: var.get() for k, var in self.sb.items()})
         return v
 
-    def _editor_blocks(self) -> bool:
+    def _editor_blocks(self, title: str = "Stations") -> bool:
         if self.editor.edit_modified():
-            messagebox.showinfo("Stations", "The Configuration tab has unsaved edits. Save or reload them there "
+            messagebox.showinfo(title, "The Configuration tab has unsaved edits. Save or reload them there "
                                 "first, so the two don't overwrite each other.", parent=self.root)
             return True
         return False
@@ -1353,6 +1768,8 @@ class GatewayApp:
         self.editor.insert("1.0", text)
         self.editor.edit_reset()
         self.editor.edit_modified(False)
+        if hasattr(self, "snmp_if_tree"):
+            self._refresh_snmp()
         try:
             cfg = self.ctl.load()
         except Exception as exc:

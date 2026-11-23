@@ -162,6 +162,23 @@ def set_in(text: str, path: list, value) -> str:
     return text[:at] + piece + text[at:]
 
 
+def set_list(text: str, path: list, items: list) -> str:
+    """Set a list, keeping it on one line ([a, b]) when it's written that way or is new.
+
+    A list written one item per line stays that way. Comments after a one-line list stay
+    on its line instead of moving to its last item.
+    """
+    node, _key, _parent = _find(_compose(text), path)
+    if node is None:
+        text = set_in(text, path, [])
+        node, _key, _parent = _find(_compose(text), path)
+    if isinstance(node, SequenceNode) and node.flow_style or \
+            isinstance(node, ScalarNode) and node.value in ("null", "~"):
+        assert node is not None
+        return text[:node.start_mark.index] + _flow(list(items)) + text[node.end_mark.index:]
+    return set_in(text, path, list(items))
+
+
 def delete_in(text: str, path: list) -> str:
     """Remove a key (no-op if it isn't there)."""
     root = _compose(text)

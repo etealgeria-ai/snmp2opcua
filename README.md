@@ -148,6 +148,13 @@ On Windows you can also double-click `run_gui.pyw`, which uses the `config.yaml`
   - Remotes below `rssi_warning_dbm` are tinted amber and labelled "weak signal". Offline remotes are tinted red and labelled.
   - An OPC UA tag column shows which `RemoteN` tag each radio has.
   - *Copy as report* gives the same table as the original pysnmp script.
+- **SNMP:** a form for the `snmp:` settings: what the gateway listens on and which traps it accepts.
+  - **Network interfaces:** the addresses and UDP ports to listen on (0.0.0.0 means every interface). One entry is saved as `listen_host`/`listen_port`; more become `network_interfaces`.
+  - **Communities** for v1/v2c. Traps with any other community are rejected. With no communities, any community is accepted.
+  - **Hosts:** *Accept packets from all hosts*, or only from a list of addresses and networks such as `10.10.0.0/16`.
+  - **Versions:** accept SNMP v1, v2c and/or v3, and whether to acknowledge INFORMs.
+  - **SNMPv3:** the engine ID (empty = generated once and kept), replay protection, and the users. For each user you set a name, an authentication protocol and key, a privacy protocol and key (masked, with *Show keys*), and optionally the device engine IDs it may come from. A key can be `${VARIABLE}` to keep it out of the file; the page warns when that variable isn't set on this computer.
+  - Entries are checked as you add them, with the manuals' wording (e.g. "The community public has already been added."). *Save* writes only what changed, keeping your comments and one-line lists, validates the whole file first and keeps the previous version as `.bak`. *Save and restart* applies it straight away, and *Revert* goes back to the file.
 - **Stations:** a form for GE MDS Orbit master stations, so you can change the settings without editing YAML.
   - Fields: channel, name, **IP address**, read community (masked, with *Show*), SNMP version, port, scan rate, timeout, retries, max repetitions, the RSSI warning level, the number and name of the Remote1…RemoteN tags, and whether to receive traps and create the standard trap tags.
   - *Lock current numbers* pins today's Remote numbering in the config.
@@ -359,7 +366,7 @@ snmp:
 python -m unittest discover -s tests -v
 ```
 
-The 98 tests cover:
+The 111 tests cover:
 
 - decoding a hand-encoded v1 packet and every SNMP value type
 - INFORM acknowledgements, community filtering and garbled packets
@@ -367,6 +374,7 @@ The 98 tests cover:
 - for SNMPv3: rejection of wrong keys, tampered messages, unknown users and the wrong security level
 - for SNMPv3: replay protection, engine discovery, authenticated inform responses, and time-window Reports
 - live UDP end-to-end runs with a fake publisher
+- the SNMP page: reading the `snmp:` section, checking interfaces, communities, hosts, engine IDs and v3 users (including `${VARIABLE}` keys), and saving only what changed while keeping comments
 - the desktop window's controller: start, stop and restart, live trap and rejection events, test traps, config checks with backup, and the port-in-use error
 - diagnostics: ports in use, a bad or missing config, an unreachable OPC UA server, a disconnected client session, SNMPv3 failure counters on a running gateway, and that the report contains no secrets
 - trap tags:
@@ -405,6 +413,7 @@ snmp2opcua/
   poller.py        per-device polling: OID tags, GE Orbit remotes, poll status tags
   ge_orbit.py      GE MDS Orbit remote table (RSSI/IP per remote) + command-line report
   stations.py      Stations page logic: list, validate and save GE master stations
+  snmp_settings.py SNMP page logic: read, check and save the snmp: section
   yaml_edit.py     edits config.yaml in place, keeping comments and layout
   snmpv3.py        SNMPv3 messages: auth, timeliness, decrypt, discovery Reports, inform Responses
   usm.py           USM crypto: key localization, HMAC, DES/AES
