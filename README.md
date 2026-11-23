@@ -1,4 +1,4 @@
-**Made by ClaudeAI**
+**Software made by ClaudeAI**
 
 # snmp2opcua: SNMP trap to OPC UA gateway
 
