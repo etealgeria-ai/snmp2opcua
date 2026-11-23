@@ -20,7 +20,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-c", "--config", default="config.yaml", help="path to YAML config (default: config.yaml)")
     ap.add_argument("--log-level", help="override logging level (DEBUG, INFO, WARNING...)")
     ap.add_argument("--port", type=int, help="override snmp.listen_port")
+    ap.add_argument("--gui", action="store_true", help="open the desktop window instead of running headless")
     args = ap.parse_args(argv)
+    if args.gui:
+        from .gui import main as gui_main
+        return gui_main(["-c", args.config])
 
     try:
         cfg = load_config(args.config)
@@ -30,8 +34,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"Invalid config: {exc}", file=sys.stderr)
         return 2
-    if args.port:
+    if args.port:          # one listener on this port instead of the configured network interfaces
         cfg["snmp"]["listen_port"] = args.port
+        cfg["snmp"]["network_interfaces"] = []
 
     level = (args.log_level or cfg["logging"].get("level", "INFO")).upper()
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")

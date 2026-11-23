@@ -4,6 +4,7 @@ __pycache__/
 venv/
 # SNMPv3 engine state (engine ID + boots counter), created at runtime
 snmp2opcua_engine.json
+snmp2opcua_slots.json
 # OPC UA certificates / private keys
 certs/
 *.pem

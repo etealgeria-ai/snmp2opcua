@@ -70,12 +70,12 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual((t.version, t.pdu, t.uptime, t.trap_name), ("v2c", "trap", 777, "linkDown"))
         got = [(v.name, v.type, v.value) for v in t.varbinds]
         self.assertEqual(got, [
-            ("ifIndex.3", "Integer", -5), ("ifDescr.3", "OctetString", "eth3 ✓"),
+            ("ifIndex.3", "Integer32", -5), ("ifDescr.3", "Octet String", "eth3 ✓"),
             ("1.3.6.1.4.1.1.1", "Gauge32", 4294967295), ("1.3.6.1.4.1.1.2", "Counter32", 2147483648),
             ("1.3.6.1.4.1.1.3", "Counter64", 2**64 - 1), ("1.3.6.1.4.1.1.4", "TimeTicks", 100),
             ("1.3.6.1.4.1.1.5", "IpAddress", "172.16.0.9"),
-            ("1.3.6.1.4.1.1.6", "ObjectIdentifier", "1.3.6.1.4.1.99999.1"),
-            ("1.3.6.1.4.1.1.7", "OctetString", "00:1a:2b:3c:4d:5e"), ("1.3.6.1.4.1.1.8", "Null", None)])
+            ("1.3.6.1.4.1.1.6", "Object Identifier", "1.3.6.1.4.1.99999.1"),
+            ("1.3.6.1.4.1.1.7", "Octet String", "00:1a:2b:3c:4d:5e"), ("1.3.6.1.4.1.1.8", "Null", None)])
         self.assertIn('"trap_name": "linkDown"', t.to_json())
         self.assertNotIn("public", t.to_json())  # community is not exposed by default
 
@@ -145,7 +145,8 @@ class MappingTests(unittest.TestCase):
     def test_severity(self):
         sm = SeverityMap({"default": 300, "rules": {"linkDown": 800, "1.3.6.1.4.1.9": 600,
                                                      "1.3.6.1.4.1.9.9.41": 900, "x": 5000}})
-        mk = lambda oid: parse_message(build_v2("public", oid, 1, []), SRC, R)
+        def mk(oid):
+            return parse_message(build_v2("public", oid, 1, []), SRC, R)
         self.assertEqual(sm.for_trap(mk("linkDown")), 800)
         self.assertEqual(sm.for_trap(mk("1.3.6.1.4.1.9.9.41.2.0.1")), 900)
         self.assertEqual(sm.for_trap(mk("1.3.6.1.4.1.9.1.0.5")), 600)

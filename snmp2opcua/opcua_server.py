@@ -7,6 +7,10 @@ Address space (namespace index is usually 2):
     LastTrap/ SourceIP, Version, PduType, SecurityName, TrapOID, TrapName, Uptime, ReceivedAt, VarBindsJson, Json
     RecentTrapsJson                             JSON array of the last N traps (newest first)
     Devices/<source-ip>/ TrapCount, LastTrapOID, LastTrapName, LastTrapTime, LastTrapJson
+
+  Objects/<Channel>/<Device>/<Tag>              ns=2;s=Channel.Device.Tag   (SNMP-driver style trap tags)
+    trap tags (Boolean, writable: write 0 to reset), table fields [n], EVENTS_COUNT (writable),
+    EVENTS_001.., EVENTS_nnn_FLDCNT, EVENTS_nnn_mmm; tag groups ("Group.Tag") become folders
 """
 from __future__ import annotations
 
@@ -19,9 +23,14 @@ from asyncua import Server, ua
 
 from .receiver import Stats
 from .severity import SeverityMap
+from .snmp_driver import OPCUA_TYPES, DeviceDef
 from .trap import Trap
 
 log = logging.getLogger("snmp2opcua.opcua_server")
+
+# OPC UA built-in type -> data type name as shown in the window (server-style names)
+KEPWARE_TYPE = {"Boolean": "Boolean", "String": "String", "Int32": "Long", "UInt32": "DWord", "UInt64": "QWord",
+                "Float": "Float", "Double": "Double", "DateTime": "Date"}
 
 S = ua.VariantType.String
 U32 = ua.VariantType.UInt32
@@ -30,9 +39,22 @@ DT = ua.VariantType.DateTime
 
 
 class OpcUaServerPublisher:
-    def __init__(self, cfg: dict, severity: SeverityMap):
+    def __init__(self, cfg: dict, severity: SeverityMap, devices: list[DeviceDef] | None = None):
         self.cfg = cfg
         self.severity = severity
+        self.devices_cfg = devices or []
+        self.tag_nodes: dict[str, tuple[object, object]] = {}   # path -> (node, variant type)
+        self.writable_paths: set[str] = set()
+        self.extra_tags: list[tuple[str, str]] = []             # (path, data type), e.g. polling status
+        self._folders: dict[str, object] = {}
+        self._objects = None
+        # writes to the gateway's own nodes are reported to the desktop window's Live data view
+        self.observer = None
+        self.node_paths: dict = {}                              # node -> "Gateway.LastTrap.TrapName"
+        self.gw_catalog: dict[str, tuple[object, str]] = {}     # path -> (initial value, data type)
+        self._pending: list[tuple[str, object, str]] = []
+        self.engine = None                                      # set by the gateway (for client resets)
+        self._reset_sub = None
         self.server: Server | None = None
         self.idx = 2
         self.recent: deque[dict] = deque(maxlen=int(cfg.get("recent_traps", 50)))
@@ -52,11 +74,36 @@ class OpcUaServerPublisher:
         return await parent.add_object(self._nid(path), self._qn(name))
 
     async def _var(self, parent, path: str, name: str, value, vtype):
-        return await parent.add_variable(self._nid(f"{path}.{name}"), self._qn(name), value, varianttype=vtype)
+        node = await parent.add_variable(self._nid(f"{path}.{name}"), self._qn(name), value, varianttype=vtype)
+        full = f"{path}.{name}"
+        self.node_paths[node] = full
+        self.gw_catalog[full] = (value, KEPWARE_TYPE.get(vtype.name, vtype.name))
+        if self.server is not None:                    # created while running (a new trap source)
+            self._pending.append((full, value, KEPWARE_TYPE.get(vtype.name, vtype.name)))
+        return node
 
-    @staticmethod
-    async def _write(node, value, vtype):
+    async def _write(self, node, value, vtype):
         await node.write_value(value, vtype)
+        path = self.node_paths.get(node)
+        if path is not None:
+            dtype = KEPWARE_TYPE.get(vtype.name, vtype.name)
+            self.gw_catalog[path] = (value, dtype)
+            if self.observer is not None:
+                self._pending.append((path, value, dtype))
+
+    def _flush(self) -> None:
+        if self._pending and self.observer is not None:
+            items, self._pending = self._pending, []
+            try:
+                self.observer(items)
+            except Exception:
+                log.debug("observer failed", exc_info=True)
+        else:
+            self._pending = []
+
+    def catalog(self) -> list[tuple[str, object, str]]:
+        """The gateway's own variables (Status, LastTrap, ...) with their current values."""
+        return [(p, v, t) for p, (v, t) in self.gw_catalog.items()]
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -117,9 +164,96 @@ class OpcUaServerPublisher:
             )
             self.evgen = await server.get_event_generator(etype, gw)
 
+        await self._build_driver_tree(objects)
+
         self.server = server
         await server.start()
+        await self._watch_resets()
         log.info("OPC UA server running at %s (namespace index %d)", cfg["endpoint"], self.idx)
+
+    async def _folder(self, path: str):
+        if path in self._folders:
+            return self._folders[path]
+        parent_path, _, name = path.rpartition(".")
+        parent = await self._folder(parent_path) if parent_path else self._objects
+        node = await parent.add_folder(self._nid(path), self._qn(name))
+        self._folders[path] = node
+        return node
+
+    async def _add_tag(self, path: str, data_type: str, writable: bool = False):
+        parent_path, _, name = path.rpartition(".")
+        parent = await self._folder(parent_path)
+        vtype = getattr(ua.VariantType, OPCUA_TYPES[data_type])
+        initial = {"Boolean": False, "String": "", "Int32": 0, "UInt32": 0, "Float": 0.0, "Double": 0.0,
+                   "DateTime": datetime(1970, 1, 1, tzinfo=timezone.utc)}[OPCUA_TYPES[data_type]]
+        node = await parent.add_variable(self._nid(path), self._qn(name), initial, varianttype=vtype)
+        if writable:
+            await node.set_writable()
+            self.writable_paths.add(path)
+        self.tag_nodes[path] = (node, vtype)
+        return node, vtype
+
+    async def _build_driver_tree(self, objects) -> None:
+        """Channel -> Device -> Tag, with Kepware-style string NodeIds ns=<idx>;s=Channel.Device.Tag."""
+        self._objects = objects
+        for dev in self.devices_cfg:
+            await self._folder(dev.path)
+            for tag in dev.tags:
+                await self._add_tag(dev.tag_path(tag), tag.data_type, tag.writable)
+        for path, data_type in self.extra_tags:
+            if path not in self.tag_nodes:
+                await self._add_tag(path, data_type)
+        if self.tag_nodes:
+            log.info("Created %d tags for %d devices", len(self.tag_nodes), len(self.devices_cfg))
+
+    async def _watch_resets(self) -> None:
+        """Notice when an OPC UA client writes 0 to a trap tag or EVENTS_COUNT, to keep the engine in step."""
+        writable = [(p, self.tag_nodes[p][0]) for p in sorted(self.writable_paths)]
+        if not writable or self.server is None:
+            return
+        paths = {n.nodeid: p for p, n in writable}
+        outer = self
+
+        class Handler:
+            def datachange_notification(self, node, val, data):
+                if not val and outer.engine is not None:
+                    outer.engine.reset(paths.get(node.nodeid, ""))
+
+        try:
+            self._reset_sub = await self.server.create_subscription(500, Handler())
+            await self._reset_sub.subscribe_data_change([n for _, n in writable])
+        except Exception:
+            log.debug("Could not watch trap tag resets", exc_info=True)
+
+    async def _apply_tag_updates(self, trap: Trap) -> None:
+        await self.apply_updates(trap.tag_updates)
+
+    async def apply_updates(self, updates) -> None:
+        """Write tag updates; tags first seen now (e.g. a new remote radio) get their node created."""
+        if self.server is None:
+            return
+        for u in updates:
+            entry = self.tag_nodes.get(u.path)
+            if entry is None:
+                if u.value is None:
+                    continue
+                entry = await self._add_tag(u.path, u.data_type)
+            node, vtype = entry
+            if u.value is None:
+                continue
+            if u.op == "inc":
+                try:
+                    current = int(await node.read_value() or 0)
+                except Exception:
+                    current = 0
+                await self._write(node, (current + 1) & 0xFFFFFFFF, vtype)
+            else:
+                value = u.value
+                if vtype == ua.VariantType.UInt32:
+                    value = int(value) & 0xFFFFFFFF
+                elif vtype == ua.VariantType.Int32:
+                    value = max(-2**31, min(2**31 - 1, int(value)))
+                await self._write(node, value, vtype)
 
     async def stop(self) -> None:
         if self.server is not None:
@@ -149,6 +283,7 @@ class OpcUaServerPublisher:
         return dev
 
     async def publish(self, trap: Trap) -> None:
+        await self._apply_tag_updates(trap)
         n = self.nodes
         trap_json = trap.to_json()
         varbinds_json = trap.varbinds_json()
@@ -187,6 +322,12 @@ class OpcUaServerPublisher:
             ev.TrapName = trap.trap_name
             ev.VarBindsJson = varbinds_json
             await self.evgen.trigger(message=trap.summary())
+        self._flush()
+
+    def diagnostics(self) -> dict:
+        return {"kind": "server", "endpoint": self.cfg["endpoint"], "running": self.server is not None,
+                "namespace_index": self.idx, "devices": len(self.devices), "max_devices": self.max_devices,
+                "events": self.evgen is not None, "trap_tags": len(self.tag_nodes)}
 
     async def update_status(self, stats: Stats) -> None:
         if self.server is None:
@@ -197,3 +338,4 @@ class OpcUaServerPublisher:
         await self._write(n["dropped"], stats.dropped, U64)
         await self._write(n["rejected"], stats.rejected, U64)
         await self._write(n["malformed"], stats.malformed, U64)
+        self._flush()

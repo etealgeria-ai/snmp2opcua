@@ -62,6 +62,10 @@ class OpcUaClientPublisher:
         self.targets: list[tuple[str, object, ua.VariantType]] = []
         self.count = 0
         self.delay = float(cfg.get("reconnect_delay", 5))
+        self.connects = 0
+        self.write_errors = 0
+        self.last_error: str | None = None
+        self.last_error_at: datetime | None = None
         unknown = set(cfg.get("nodes") or {}) - set(FIELDS)
         if unknown:
             raise ValueError(f"Unknown field(s) in opcua.client.nodes: {sorted(unknown)}; "
@@ -73,6 +77,7 @@ class OpcUaClientPublisher:
         try:
             await self._connect()
         except Exception as exc:  # keep running; publish() retries
+            self._note_error(f"connection: {exc}")
             log.error("Initial connection to %s failed: %s (will retry)", self.cfg["url"], exc)
             await self._disconnect()
 
@@ -98,6 +103,7 @@ class OpcUaClientPublisher:
             targets.append((field_name, node, vtype))
             log.debug("Mapped %s -> %s (%s)", field_name, nodeid, vtype.name)
         self.targets = targets
+        self.connects += 1
         log.info("Connected to OPC UA server %s (%d target nodes)", cfg["url"], len(targets))
 
     async def _disconnect(self) -> None:
@@ -121,6 +127,7 @@ class OpcUaClientPublisher:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._note_error(f"connection: {exc}")
                 log.error("OPC UA write failed (%s); reconnecting in %gs", exc, self.delay)
                 await self._disconnect()
                 await asyncio.sleep(self.delay)
@@ -134,7 +141,21 @@ class OpcUaClientPublisher:
                 if any(h in str(exc) for h in CONNECTION_HINTS):
                     raise
                 # Server is reachable but refused this node (type, access rights...): skip it
+                self.write_errors += 1
+                self._note_error(f"write to {node.nodeid.to_string()} ({field_name}) rejected: {exc}")
                 log.error("Write to %s (%s) rejected: %s", node.nodeid.to_string(), field_name, exc)
+
+    def _note_error(self, text: str) -> None:
+        self.last_error = text
+        self.last_error_at = datetime.now()
+
+    def diagnostics(self) -> dict:
+        return {"kind": "client", "url": self.cfg["url"], "connected": self.client is not None,
+                "targets": len(self.targets),
+                "configured_nodes": len([v for v in (self.cfg.get("nodes") or {}).values() if v]),
+                "connects": self.connects, "write_errors": self.write_errors, "written": self.count,
+                "last_error": self.last_error,
+                "last_error_at": self.last_error_at.strftime("%H:%M:%S") if self.last_error_at else None}
 
     async def update_status(self, stats: Stats) -> None:
         return None

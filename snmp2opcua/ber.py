@@ -6,6 +6,7 @@ hostile packets raise BerError instead of hanging or crashing the gateway.
 from __future__ import annotations
 
 import ipaddress
+import struct
 
 # Universal tags
 INTEGER = 0x02
@@ -25,11 +26,13 @@ NO_SUCH_OBJECT = 0x80
 NO_SUCH_INSTANCE = 0x81
 END_OF_MIB_VIEW = 0x82
 
+# SNMP data type names as used in SNMP agent manuals (e.g. Kepware SNMP Agent Plug-In).
+# Unsigned32 and Gauge32 share one wire tag, so it is reported as Gauge32.
 TYPE_NAMES = {
-    INTEGER: "Integer",
-    OCTET_STRING: "OctetString",
+    INTEGER: "Integer32",
+    OCTET_STRING: "Octet String",
     NULL: "Null",
-    OBJECT_IDENTIFIER: "ObjectIdentifier",
+    OBJECT_IDENTIFIER: "Object Identifier",
     IP_ADDRESS: "IpAddress",
     COUNTER32: "Counter32",
     GAUGE32: "Gauge32",
@@ -142,6 +145,12 @@ def decode_value(tag: int, content: bytes):
         return name, str(ipaddress.IPv4Address(content))
     if tag in (NULL, NO_SUCH_OBJECT, NO_SUCH_INSTANCE, END_OF_MIB_VIEW):
         return name, None
+    if tag == OPAQUE:
+        # net-snmp wraps floats in Opaque: 9f 78 04 <float> / 9f 79 08 <double>
+        if len(content) == 7 and content[:3] == b"\x9f\x78\x04":
+            return name, struct.unpack(">f", content[3:])[0]
+        if len(content) == 11 and content[:3] == b"\x9f\x79\x08":
+            return name, struct.unpack(">d", content[3:])[0]
     # Opaque and anything unknown: keep the raw bytes as hex
     return name, content.hex()
 

@@ -13,7 +13,7 @@ from snmp2opcua.config import build_v3_users, load_config
 from snmp2opcua.gateway import Gateway
 from snmp2opcua.oids import OidResolver
 from snmp2opcua.sendtrap import build_v3, discovery_probe, encode_typed, read_v3_reply, send_v3_inform, varbind
-from snmp2opcua.snmpv3 import PDU_REPORT, SnmpV3Engine, V3Rejected, load_engine_state, parse_header
+from snmp2opcua.snmpv3 import PDU_REPORT, SnmpV3Engine, V3Rejected, load_engine_state
 from snmp2opcua.trap import PDU_GET_RESPONSE, UnsupportedMessage
 from snmp2opcua.usm import AUTH_PROTOCOLS, PRIV_PROTOCOLS, UsmError, UsmUser, localize_key, password_to_key
 
@@ -100,7 +100,8 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual((trap.version, trap.trap_name, trap.uptime), ("v3", "linkDown", 42))
                     self.assertEqual((trap.security_name, trap.security_level, trap.engine_id, trap.context_name),
                                      ("opcgw", u.level, DEVICE_ENGINE.hex(), "ctx"))
-                    self.assertEqual([(v.name, v.value) for v in trap.varbinds], [("ifIndex.3", 3), ("ifDescr.3", "Gi0/3")])
+                    self.assertEqual([(v.name, v.value) for v in trap.varbinds],
+                                     [("ifIndex.3", 3), ("ifDescr.3", "Gi0/3")])
                     if priv != "NONE":
                         self.assertNotIn(b"Gi0/3", pkt)    # really encrypted
 
@@ -277,7 +278,8 @@ class EndToEndV3(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, 3)
             tmp.cleanup()
         self.assertEqual([(t.trap_name, t.security_name, t.pdu) for t in pub.traps],
-                         [("linkDown", "opcgw", "trap"), ("linkUp", "legacy", "trap"), ("warmStart", "opcgw", "inform")])
+                         [("linkDown", "opcgw", "trap"), ("linkUp", "legacy", "trap"),
+                          ("warmStart", "opcgw", "inform")])
         self.assertEqual((gw.stats.received, gw.stats.rejected), (3, 1))
 
 
