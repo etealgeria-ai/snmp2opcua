@@ -1,3 +1,5 @@
+**Made by ClaudeAI**
+
 # snmp2opcua: SNMP trap to OPC UA gateway
 
 Receives SNMP traps from switches, UPSs, PLCs, firewalls and similar devices, and publishes them over OPC UA so SCADA, HMI and historian systems can use them.
